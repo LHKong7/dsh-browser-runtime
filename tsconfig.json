@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2024", "DOM"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "verbatimModuleSyntax": false,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "types": ["node"],
+    "rootDir": ".",
+    "paths": {
+      "dsh-browser-runtime": ["./src/index.ts"],
+      "dsh-browser-runtime/playwright": ["./src/playwright.ts"],
+      "dsh-browser-runtime/tools": ["./src/tools.ts"]
+    }
+  },
+  "include": ["src", "tests", "vitest.config.ts"]
+}

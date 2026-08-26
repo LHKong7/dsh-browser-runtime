@@ -1,0 +1,206 @@
+import { setTimeout as delay } from 'node:timers/promises'
+import {
+  BrowserCheckpointRef,
+  BrowserPageId,
+  BrowserProviderId,
+  BrowserProviderTargetStaleError,
+} from 'dsh-browser-runtime'
+import type {
+  BrowserProvider,
+  BrowserProviderAction,
+  BrowserProviderCapabilities,
+  BrowserProviderCheckpoint,
+  BrowserProviderEnvironment,
+  BrowserProviderObservation,
+  BrowserProviderOpenRequest,
+  BrowserProviderRestoreRequest,
+  BrowserCheckpointRef as BrowserCheckpointRefType,
+} from 'dsh-browser-runtime'
+
+interface FakeProviderOptions {
+  readonly id?: string
+  readonly capabilities?: Partial<BrowserProviderCapabilities>
+  readonly actionDelayMs?: number
+  readonly checkpointError?: Error
+  readonly closeError?: Error
+  readonly available?: boolean
+}
+
+interface FakeTarget {
+  readonly key: string
+}
+
+/** Deterministic provider used by runtime and tool contract tests. */
+export class FakeBrowserProvider implements BrowserProvider {
+  readonly id
+  readonly capabilities
+  readonly environments: FakeEnvironment[] = []
+  readonly destroyed: BrowserCheckpointRefType[] = []
+  opens = 0
+  restores = 0
+  disposes = 0
+  activeActions = 0
+  maxActiveActions = 0
+  private checkpointSequence = 0
+  private readonly options: FakeProviderOptions
+
+  constructor(options: FakeProviderOptions = {}) {
+    this.options = options
+    this.id = BrowserProviderId(options.id ?? 'fake')
+    this.capabilities = {
+      checkpoint: true,
+      screenshot: true,
+      multiplePages: false,
+      attachExisting: false,
+      persistentProfile: false,
+      networkEvents: false,
+      ...options.capabilities,
+    }
+  }
+
+  available(): boolean {
+    return this.options.available ?? true
+  }
+
+  open(request: BrowserProviderOpenRequest): Promise<BrowserProviderEnvironment> {
+    this.opens += 1
+    return Promise.resolve(this.makeEnvironment(request))
+  }
+
+  restore(request: BrowserProviderRestoreRequest): Promise<BrowserProviderEnvironment> {
+    this.restores += 1
+    return Promise.resolve(this.makeEnvironment(request))
+  }
+
+  destroyCheckpoint(ref: BrowserCheckpointRefType): Promise<void> {
+    this.destroyed.push(ref)
+    return Promise.resolve()
+  }
+
+  dispose(): Promise<void> {
+    this.disposes += 1
+    return Promise.resolve()
+  }
+
+  nextCheckpoint(): BrowserCheckpointRefType {
+    this.checkpointSequence += 1
+    return BrowserCheckpointRef(`fake-checkpoint-${this.checkpointSequence}`)
+  }
+
+  async enterAction(): Promise<void> {
+    this.activeActions += 1
+    this.maxActiveActions = Math.max(this.maxActiveActions, this.activeActions)
+    await delay(this.options.actionDelayMs ?? 0)
+    this.activeActions -= 1
+  }
+
+  private makeEnvironment(request: BrowserProviderOpenRequest): FakeEnvironment {
+    const environment = new FakeEnvironment(this, request, this.options)
+    this.environments.push(environment)
+    return environment
+  }
+}
+
+/** Mutable single-page environment behind FakeBrowserProvider. */
+export class FakeEnvironment implements BrowserProviderEnvironment {
+  url = 'about:blank'
+  title = ''
+  text = 'Blank page'
+  closes = 0
+  checkpoints = 0
+  activeActions = 0
+  maxActiveActions = 0
+  private revision = 0
+
+  constructor(
+    private readonly provider: FakeBrowserProvider,
+    readonly request: BrowserProviderOpenRequest,
+    private readonly options: FakeProviderOptions,
+  ) {}
+
+  observe({ maxTextChars, signal }: { maxTextChars: number; signal: AbortSignal }): Promise<BrowserProviderObservation> {
+    signal.throwIfAborted()
+    this.revision += 1
+    const body = this.text.slice(0, maxTextChars)
+    return Promise.resolve({
+      pageId: BrowserPageId('page-1'),
+      url: this.url,
+      title: this.title,
+      text: body,
+      truncated: body.length < this.text.length,
+      elements: [
+        {
+          kind: 'button',
+          name: 'Advance',
+          disabled: false,
+          fingerprint: 'advance',
+          target: { key: 'advance' } satisfies FakeTarget,
+        },
+        {
+          kind: 'input:text',
+          name: 'Name',
+          disabled: false,
+          inputType: 'text',
+          fingerprint: 'name',
+          target: { key: 'name' } satisfies FakeTarget,
+        },
+        {
+          kind: 'input:password',
+          name: 'Password',
+          disabled: false,
+          inputType: 'password',
+          fingerprint: 'password',
+          target: { key: 'password' } satisfies FakeTarget,
+        },
+      ],
+    })
+  }
+
+  async act(action: BrowserProviderAction, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted()
+    this.activeActions += 1
+    this.maxActiveActions = Math.max(this.maxActiveActions, this.activeActions)
+    try {
+      await this.provider.enterAction()
+      signal.throwIfAborted()
+      if (action.type === 'navigate') {
+        this.url = action.url
+        this.title = 'Fake page'
+        this.text = `Page at ${action.url}`
+        return
+      }
+      if (!isFakeTarget(action.target.target) || action.target.fingerprint !== action.target.target.key) {
+        throw new BrowserProviderTargetStaleError()
+      }
+      if (action.type === 'click') this.text = `Advanced ${this.revision}`
+      else this.text = `Filled ${action.value.length} characters`
+    } finally {
+      this.activeActions -= 1
+    }
+  }
+
+  screenshot({ signal }: { fullPage: boolean; signal: AbortSignal }): Promise<Uint8Array> {
+    signal.throwIfAborted()
+    return Promise.resolve(Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10))
+  }
+
+  checkpoint(signal: AbortSignal): Promise<BrowserProviderCheckpoint> {
+    signal.throwIfAborted()
+    this.checkpoints += 1
+    if (this.options.checkpointError !== undefined) return Promise.reject(this.options.checkpointError)
+    return Promise.resolve({
+      ref: this.provider.nextCheckpoint(),
+      coverage: ['cookies', 'local-storage'],
+    })
+  }
+
+  close(): Promise<void> {
+    this.closes += 1
+    if (this.options.closeError !== undefined) return Promise.reject(this.options.closeError)
+    return Promise.resolve()
+  }
+}
+
+function isFakeTarget(value: unknown): value is FakeTarget {
+  return typeof value === 'object' && value !== null && 'key' in value && typeof value.key === 'string'
+}

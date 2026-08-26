@@ -1,0 +1,836 @@
+/** Provider-neutral ownership, lifecycle, observation, transition, and checkpoint control plane. */
+
+import { createHash, randomUUID } from 'node:crypto'
+import { Context, Service } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import type { Domain } from '@deepseek-ai/dsh-storage-domain'
+import { BrowserRuntimeError, BrowserProviderPolicyError, BrowserProviderTargetStaleError, errorEvidence } from './error.ts'
+import { browserRuntimeDomainSpec, transitionRecord } from './metadata.ts'
+import type { BrowserTransitionRecord } from './metadata.ts'
+import { SerialExecutor } from './serial.ts'
+import {
+  BrowserCheckpointRef,
+  BrowserElementRef,
+  BrowserEnvironmentId,
+  BrowserObservationId,
+  BrowserProviderId,
+  BrowserTransitionId,
+} from './types.ts'
+import type {
+  BrowserAcquireRequest,
+  BrowserAction,
+  BrowserCapability,
+  BrowserCheckpointRecord,
+  BrowserElement,
+  BrowserEnvironmentLease,
+  BrowserObservation,
+  BrowserPersistence,
+  BrowserProvider,
+  BrowserProviderAction,
+  BrowserProviderCapabilities,
+  BrowserProviderEnvironment,
+  BrowserProviderId as BrowserProviderIdType,
+  BrowserProviderInfo,
+  BrowserProviderTarget,
+  BrowserRecordedAction,
+  BrowserScreenshot,
+  BrowserScreenshotOptions,
+  BrowserSessionId,
+  BrowserTransition,
+} from './types.ts'
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    browserRuntime: BrowserRuntime
+  }
+}
+
+/** Runtime selection, observation, evidence, and teardown bounds. */
+export interface Config {
+  /** Explicit provider id; omission auto-selects exactly one available provider. */
+  readonly provider?: string
+  /** Maximum page-text characters retained in each observation. */
+  readonly maxTextChars?: number
+  /** Maximum transition records retained in process memory. */
+  readonly maxTransitionsInMemory?: number
+  /** Maximum time allowed for a shutdown checkpoint before provider close proceeds. */
+  readonly cleanupTimeoutMs?: number
+}
+
+interface ResolvedConfig {
+  readonly provider?: BrowserProviderIdType
+  readonly maxTextChars: number
+  readonly maxTransitionsInMemory: number
+  readonly cleanupTimeoutMs: number
+}
+
+interface EnvironmentSlot {
+  readonly owner: object
+  readonly sessionId: BrowserSessionId
+  readonly environmentId: BrowserEnvironmentId
+  readonly persistence: BrowserPersistence
+  readonly requestedProviderId?: BrowserProviderIdType
+  readonly requiredCapabilities: readonly BrowserCapability[]
+  readonly opening: AbortController
+  ready: Promise<ActiveEnvironment>
+  providerId?: BrowserProviderIdType
+  refs: number
+  pendingAcquires: number
+  closing?: Promise<void>
+}
+
+interface BoundElement {
+  readonly view: BrowserElement
+  readonly provider: BrowserProviderTarget
+}
+
+/** Cordis plugin name used by loader diagnostics. */
+export const name = 'browser-runtime'
+
+/** Runtime service configuration schema. */
+export const Config: z<Config> = z.object({
+  provider: z.string(),
+  maxTextChars: z.number().default(60_000),
+  maxTransitionsInMemory: z.number().default(500),
+  cleanupTimeoutMs: z.number().default(10_000),
+})
+
+const EMPTY_CAPABILITIES: BrowserProviderCapabilities = {
+  checkpoint: false,
+  screenshot: false,
+  multiplePages: false,
+  attachExisting: false,
+  persistentProfile: false,
+  networkEvents: false,
+}
+
+/** Stateful browser environment service registered as `ctx.browserRuntime`. */
+export class BrowserRuntime extends Service {
+  static Config = Config
+
+  private readonly config: ResolvedConfig
+  private readonly providers = new Map<BrowserProviderIdType, BrowserProvider>()
+  private readonly slots = new Map<object, EnvironmentSlot>()
+  private readonly checkpoints = new Map<BrowserSessionId, BrowserCheckpointRecord>()
+  private readonly transitions: BrowserTransitionRecord[] = []
+  private metadataDomain: Domain<typeof browserRuntimeDomainSpec> | undefined
+  private awaitMetadataBinding: () => Promise<void> = () => Promise.resolve()
+  private state: 'active' | 'closing' | 'closed' = 'active'
+
+  constructor(ctx: Context, config: Config = {}) {
+    super(ctx, 'browserRuntime')
+    this.config = resolveConfig(config)
+
+    const storageFiber = ctx.inject(['storageDomain'], async (storageCtx: Context) => {
+      const domain = await storageCtx.storageDomain.open(browserRuntimeDomainSpec)
+      for (const [sessionId, checkpoint] of domain.table('checkpoints').entries()) {
+        this.checkpoints.set(sessionId, checkpoint)
+      }
+      this.metadataDomain = domain
+      storageCtx.effect(() => async () => {
+        if (this.metadataDomain === domain) this.metadataDomain = undefined
+        await domain.close()
+      }, 'browserRuntime.metadataDomain()')
+    })
+    this.awaitMetadataBinding = async () => {
+      if (ctx.get('storageDomain') !== undefined) await storageFiber.await()
+    }
+
+    ctx.effect(() => async () => {
+      await this.disposeRuntime()
+      await storageFiber.dispose()
+    }, 'browserRuntime.teardown()')
+  }
+
+  /**
+   * Register one provider. Registration is effect-scoped; disposing it first
+   * removes the provider from selection, then closes its environments and
+   * finally disposes provider-wide resources.
+   * @param provider - provider implementation keyed by its opaque id.
+   * @returns asynchronous disposer that reaches provider quiescence.
+   */
+  registerProvider(provider: BrowserProvider): () => Promise<void> {
+    if (this.providers.has(provider.id)) {
+      throw new BrowserRuntimeError(
+        `a browser provider with id "${provider.id}" is already registered`,
+        'BROWSER_DUPLICATE_PROVIDER',
+      )
+    }
+    return this.ctx.effect(function* (this: BrowserRuntime) {
+      this.providers.set(provider.id, provider)
+      yield () => this.removeProvider(provider)
+    }.bind(this), 'browserRuntime.registerProvider()')
+  }
+
+  /**
+   * Resolve and acquire one owner environment. Concurrent calls for the same
+   * exact owner share setup and receive independent leases; different owners
+   * never share state.
+   * @param request - owner, durable session identity, policy, and cancellation.
+   * @returns a holder capability over the active environment.
+   */
+  async acquire(request: BrowserAcquireRequest): Promise<BrowserEnvironmentLease> {
+    this.assertActive()
+    request.signal?.throwIfAborted()
+    await this.awaitMetadataBinding()
+    this.assertActive()
+    request.signal?.throwIfAborted()
+    let slot = this.slots.get(request.owner)
+    if (slot === undefined) {
+      const environmentId = BrowserEnvironmentId(`browser-${randomUUID()}`)
+      const requestedProviderId = request.providerId ?? this.config.provider
+      slot = {
+        owner: request.owner,
+        sessionId: request.sessionId,
+        environmentId,
+        persistence: request.persistence,
+        ...(requestedProviderId === undefined ? {} : { requestedProviderId }),
+        requiredCapabilities: [...new Set(request.requiredCapabilities ?? [])],
+        opening: new AbortController(),
+        ready: Promise.resolve(undefined as never),
+        refs: 0,
+        pendingAcquires: 0,
+      }
+      this.slots.set(request.owner, slot)
+      slot.ready = this.openEnvironment(slot, request.signal)
+      void slot.ready.catch(() => {
+        if (this.slots.get(request.owner) === slot) this.slots.delete(request.owner)
+      })
+    } else {
+      this.assertCompatibleOwnerRequest(slot, request)
+      if (slot.closing !== undefined) {
+        throw new BrowserRuntimeError('browser environment is closing', 'BROWSER_ENVIRONMENT_CLOSED')
+      }
+    }
+
+    slot.pendingAcquires += 1
+    try {
+      const environment = await slot.ready
+      request.signal?.throwIfAborted()
+      assertCapabilities(environment.provider.capabilities, request.requiredCapabilities ?? [])
+      slot.refs += 1
+      return this.createLease(slot, environment)
+    } finally {
+      slot.pendingAcquires -= 1
+      if (slot.pendingAcquires === 0 && slot.refs === 0) void this.closeSlot(slot).catch(error => {
+        this.ctx.logger.warn(`browser environment cleanup failed: ${String(error)}`)
+      })
+    }
+  }
+
+  /** List registered providers and their current availability. */
+  async listProviders(): Promise<readonly BrowserProviderInfo[]> {
+    return Promise.all([...this.providers.values()].map(async provider => ({
+      id: provider.id,
+      capabilities: provider.capabilities,
+      available: await providerAvailable(provider),
+    })))
+  }
+
+  /** Return the current checkpoint index record for a session, if any. */
+  checkpointFor(sessionId: BrowserSessionId): BrowserCheckpointRecord | undefined {
+    return this.checkpoints.get(sessionId)
+  }
+
+  /** Return retained transition metadata for one session in creation order. */
+  listTransitions(sessionId: BrowserSessionId): readonly BrowserTransitionRecord[] {
+    const durable = this.metadataDomain === undefined
+      ? []
+      : [...this.metadataDomain.table('transitions').entries()].map(([, value]) => value)
+    const source = durable.length > 0 ? durable : this.transitions
+    return source.filter(transition => transition.sessionId === sessionId)
+  }
+
+  /**
+   * Delete one indexed checkpoint and its provider payload. A live environment
+   * for the session must be released first.
+   * @param sessionId - durable session checkpoint to remove.
+   */
+  async destroyCheckpoint(sessionId: BrowserSessionId): Promise<void> {
+    if ([...this.slots.values()].some(slot => slot.sessionId === sessionId)) {
+      throw new BrowserRuntimeError(
+        `cannot destroy checkpoint for live browser session "${sessionId}"`,
+        'BROWSER_OWNER_CONFLICT',
+      )
+    }
+    const checkpoint = this.checkpoints.get(sessionId)
+    if (checkpoint === undefined) return
+    const provider = this.providers.get(checkpoint.providerId)
+    if (provider === undefined) {
+      throw new BrowserRuntimeError(
+        `checkpoint provider "${checkpoint.providerId}" is not registered`,
+        'BROWSER_PROVIDER_CONFIGURED_MISSING',
+      )
+    }
+    if (provider.destroyCheckpoint !== undefined) await provider.destroyCheckpoint(checkpoint.ref)
+    if (this.metadataDomain !== undefined) await this.metadataDomain.table('checkpoints').delete(sessionId)
+    this.checkpoints.delete(sessionId)
+  }
+
+  private async openEnvironment(slot: EnvironmentSlot, callerSignal?: AbortSignal): Promise<ActiveEnvironment> {
+    const signal = callerSignal === undefined
+      ? slot.opening.signal
+      : AbortSignal.any([slot.opening.signal, callerSignal])
+    signal.throwIfAborted()
+    const checkpoint = slot.persistence === 'resume' ? this.checkpoints.get(slot.sessionId) : undefined
+    const provider = await this.resolveProvider(slot.requestedProviderId, checkpoint)
+    slot.providerId = provider.id
+    assertCapabilities(provider.capabilities, slot.requiredCapabilities)
+    if (slot.persistence === 'resume' && !provider.capabilities.checkpoint) {
+      throw new BrowserRuntimeError(
+        `browser provider "${provider.id}" does not support resume checkpoints`,
+        'BROWSER_CAPABILITY_UNSUPPORTED',
+      )
+    }
+
+    const generation = checkpoint === undefined ? 1 : checkpoint.generation + 1
+    let backend: BrowserProviderEnvironment
+    if (checkpoint === undefined) {
+      backend = await provider.open({ environmentId: slot.environmentId, sessionId: slot.sessionId, signal })
+    } else {
+      if (provider.restore === undefined) {
+        throw new BrowserRuntimeError(
+          `browser provider "${provider.id}" advertises checkpoint support without restore()`,
+          'BROWSER_CHECKPOINT_UNAVAILABLE',
+        )
+      }
+      backend = await provider.restore({
+        environmentId: slot.environmentId,
+        sessionId: slot.sessionId,
+        signal,
+        checkpoint,
+      })
+    }
+    if (slot.closing !== undefined || this.state !== 'active') {
+      await backend.close()
+      throw new BrowserRuntimeError('browser environment is closing', 'BROWSER_ENVIRONMENT_CLOSED')
+    }
+    return new ActiveEnvironment(this, slot, provider, backend, generation)
+  }
+
+  private async resolveProvider(
+    requestedId: BrowserProviderIdType | undefined,
+    checkpoint: BrowserCheckpointRecord | undefined,
+  ): Promise<BrowserProvider> {
+    const checkpointId = checkpoint?.providerId
+    if (requestedId !== undefined && checkpointId !== undefined && requestedId !== checkpointId) {
+      throw new BrowserRuntimeError(
+        `checkpoint belongs to provider "${checkpointId}", not requested provider "${requestedId}"`,
+        'BROWSER_CHECKPOINT_PROVIDER_MISMATCH',
+      )
+    }
+    const exactId = requestedId ?? checkpointId
+    if (exactId !== undefined) {
+      const provider = this.providers.get(exactId)
+      if (provider === undefined) {
+        throw new BrowserRuntimeError(
+          `configured browser provider "${exactId}" is not registered`,
+          'BROWSER_PROVIDER_CONFIGURED_MISSING',
+        )
+      }
+      if (!await providerAvailable(provider)) {
+        throw new BrowserRuntimeError(
+          `configured browser provider "${exactId}" is unavailable`,
+          'BROWSER_PROVIDER_CONFIGURED_UNAVAILABLE',
+        )
+      }
+      return provider
+    }
+
+    const available: BrowserProvider[] = []
+    for (const provider of this.providers.values()) {
+      if (await providerAvailable(provider)) available.push(provider)
+    }
+    if (available.length === 0) {
+      throw new BrowserRuntimeError('no browser provider is available', 'BROWSER_PROVIDER_UNAVAILABLE')
+    }
+    if (available.length > 1) {
+      throw new BrowserRuntimeError(
+        `multiple browser providers are available: ${available.map(provider => provider.id).join(', ')}`,
+        'BROWSER_PROVIDER_AMBIGUOUS',
+      )
+    }
+    return available[0] as BrowserProvider
+  }
+
+  private createLease(slot: EnvironmentSlot, environment: ActiveEnvironment): BrowserEnvironmentLease {
+    let released = false
+    return {
+      environmentId: slot.environmentId,
+      providerId: environment.provider.id,
+      generation: environment.generation,
+      observe: signal => environment.observe(signal),
+      act: (action, signal) => environment.act(action, signal),
+      screenshot: options => environment.screenshot(options),
+      checkpoint: signal => environment.checkpoint(signal),
+      release: async () => {
+        if (released) return
+        released = true
+        slot.refs -= 1
+        if (slot.refs === 0 && slot.pendingAcquires === 0) await this.closeSlot(slot)
+      },
+    }
+  }
+
+  private closeSlot(slot: EnvironmentSlot): Promise<void> {
+    slot.closing ??= (async () => {
+      slot.opening.abort(new BrowserRuntimeError(
+        'browser environment is closing',
+        'BROWSER_ENVIRONMENT_CLOSED',
+      ))
+      try {
+        const environment = await slot.ready
+        await environment.shutdown(slot.persistence)
+      } catch (error: unknown) {
+        if (slot.providerId !== undefined || !(error instanceof BrowserRuntimeError)) throw error
+      } finally {
+        if (this.slots.get(slot.owner) === slot) this.slots.delete(slot.owner)
+      }
+    })()
+    return slot.closing
+  }
+
+  private async removeProvider(provider: BrowserProvider): Promise<void> {
+    if (this.providers.get(provider.id) !== provider) return
+    this.providers.delete(provider.id)
+    const owned = [...this.slots.values()].filter(slot => slot.providerId === provider.id)
+    const settled = await Promise.allSettled(owned.map(slot => this.closeSlot(slot)))
+    const failures = settled.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+    if (provider.dispose !== undefined) {
+      try {
+        await provider.dispose()
+      } catch (error: unknown) {
+        failures.push(error)
+      }
+    }
+    if (failures.length > 0) throw new AggregateError(failures, `browser provider "${provider.id}" cleanup failed`)
+  }
+
+  private assertCompatibleOwnerRequest(slot: EnvironmentSlot, request: BrowserAcquireRequest): void {
+    const requestedProviderId = request.providerId ?? this.config.provider
+    if (slot.sessionId !== request.sessionId
+      || slot.persistence !== request.persistence
+      || slot.requestedProviderId !== requestedProviderId) {
+      throw new BrowserRuntimeError(
+        'the browser owner already has an environment with different acquisition settings',
+        'BROWSER_OWNER_CONFLICT',
+      )
+    }
+  }
+
+  private async saveCheckpoint(
+    slot: EnvironmentSlot,
+    provider: BrowserProvider,
+    generation: number,
+    backend: BrowserProviderEnvironment,
+    signal: AbortSignal,
+  ): Promise<BrowserCheckpointRecord> {
+    if (!provider.capabilities.checkpoint || backend.checkpoint === undefined) {
+      throw new BrowserRuntimeError(
+        `browser provider "${provider.id}" cannot create checkpoints`,
+        'BROWSER_CHECKPOINT_UNAVAILABLE',
+      )
+    }
+    const payload = await backend.checkpoint(signal)
+    const record: BrowserCheckpointRecord = {
+      sessionId: slot.sessionId,
+      environmentId: slot.environmentId,
+      generation,
+      providerId: provider.id,
+      ref: BrowserCheckpointRef(payload.ref),
+      coverage: [...payload.coverage],
+      createdAt: new Date().toISOString(),
+    }
+    const previous = this.checkpoints.get(slot.sessionId)
+    this.checkpoints.set(slot.sessionId, record)
+    try {
+      if (this.metadataDomain !== undefined) {
+        await this.metadataDomain.table('checkpoints').put(slot.sessionId, record)
+      }
+    } catch (error: unknown) {
+      if (previous === undefined) this.checkpoints.delete(slot.sessionId)
+      else this.checkpoints.set(slot.sessionId, previous)
+      throw new BrowserRuntimeError(
+        'browser checkpoint metadata could not be persisted',
+        'BROWSER_EVIDENCE_WRITE_FAILED',
+        { cause: error },
+      )
+    }
+    if (previous !== undefined && previous.ref !== record.ref && previous.providerId === provider.id) {
+      void provider.destroyCheckpoint?.(previous.ref).catch(error => {
+        this.ctx.logger.warn(`old browser checkpoint cleanup failed: ${String(error)}`)
+      })
+    }
+    return record
+  }
+
+  private async saveTransition(transition: BrowserTransition): Promise<void> {
+    const record = transitionRecord(transition)
+    this.transitions.push(record)
+    if (this.transitions.length > this.config.maxTransitionsInMemory) this.transitions.shift()
+    if (this.metadataDomain === undefined) return
+    try {
+      await this.metadataDomain.table('transitions').put(record.id, record)
+    } catch (error: unknown) {
+      throw new BrowserRuntimeError(
+        `transition "${record.id}" could not be persisted`,
+        'BROWSER_EVIDENCE_WRITE_FAILED',
+        { cause: error },
+      )
+    }
+  }
+
+  private async disposeRuntime(): Promise<void> {
+    if (this.state !== 'active') return
+    this.state = 'closing'
+    const settled = await Promise.allSettled([...this.slots.values()].map(slot => this.closeSlot(slot)))
+    this.state = 'closed'
+    const failures = settled.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+    if (failures.length > 0) throw new AggregateError(failures, 'browser runtime cleanup failed')
+  }
+
+  private assertActive(): void {
+    if (this.state !== 'active') {
+      throw new BrowserRuntimeError('browser runtime is closing', 'BROWSER_ENVIRONMENT_CLOSED')
+    }
+  }
+
+  /** @internal */
+  observationTextLimit(): number {
+    return this.config.maxTextChars
+  }
+
+  /** @internal */
+  cleanupTimeout(): number {
+    return this.config.cleanupTimeoutMs
+  }
+
+  /** @internal */
+  persistTransition(transition: BrowserTransition): Promise<void> {
+    return this.saveTransition(transition)
+  }
+
+  /** @internal */
+  persistCheckpoint(
+    slot: EnvironmentSlot,
+    provider: BrowserProvider,
+    generation: number,
+    backend: BrowserProviderEnvironment,
+    signal: AbortSignal,
+  ): Promise<BrowserCheckpointRecord> {
+    return this.saveCheckpoint(slot, provider, generation, backend, signal)
+  }
+}
+
+/** One active environment behind every lease for an owner. */
+class ActiveEnvironment {
+  readonly generation: number
+  readonly provider: BrowserProvider
+  private readonly queue = new SerialExecutor()
+  private revision = 0
+  private latest: BrowserObservation | undefined
+  private latestElements = new Map<BrowserElementRef, BoundElement>()
+  private shutdownPromise: Promise<void> | undefined
+
+  constructor(
+    private readonly runtime: BrowserRuntime,
+    private readonly slot: EnvironmentSlot,
+    provider: BrowserProvider,
+    private readonly backend: BrowserProviderEnvironment,
+    generation: number,
+  ) {
+    this.provider = provider
+    this.generation = generation
+  }
+
+  observe(signal?: AbortSignal): Promise<BrowserObservation> {
+    return this.queue.run(operationSignal => this.observeNow(operationSignal), signal)
+  }
+
+  act(action: BrowserAction, signal?: AbortSignal): Promise<BrowserTransition> {
+    return this.queue.run(operationSignal => this.actNow(action, operationSignal), signal)
+  }
+
+  screenshot(options: BrowserScreenshotOptions = {}): Promise<BrowserScreenshot> {
+    return this.queue.run(async (signal) => {
+      assertCapabilities(this.provider.capabilities, ['screenshot'])
+      const observation = this.latest ?? await this.observeNow(signal)
+      const data = await this.backend.screenshot({ fullPage: options.fullPage ?? false, signal })
+      return {
+        environmentId: this.slot.environmentId,
+        observationId: observation.id,
+        url: observation.url,
+        title: observation.title,
+        data,
+      }
+    }, options.signal)
+  }
+
+  checkpoint(signal?: AbortSignal): Promise<BrowserCheckpointRecord> {
+    return this.queue.run(operationSignal => this.runtime.persistCheckpoint(
+      this.slot,
+      this.provider,
+      this.generation,
+      this.backend,
+      operationSignal,
+    ), signal)
+  }
+
+  shutdown(persistence: BrowserPersistence): Promise<void> {
+    this.shutdownPromise ??= this.runShutdown(persistence)
+    return this.shutdownPromise
+  }
+
+  private async observeNow(signal: AbortSignal): Promise<BrowserObservation> {
+    const providerObservation = await this.backend.observe({
+      maxTextChars: this.runtime.observationTextLimit(),
+      signal,
+    })
+    this.revision += 1
+    const bindings = new Map<BrowserElementRef, BoundElement>()
+    const elements = providerObservation.elements.map((element, index) => {
+      const ref = BrowserElementRef(`e${index + 1}`)
+      const view: BrowserElement = {
+        ref,
+        kind: element.kind,
+        name: element.name,
+        disabled: element.disabled,
+        ...(element.inputType === undefined ? {} : { inputType: element.inputType }),
+      }
+      bindings.set(ref, {
+        view,
+        provider: { target: element.target, fingerprint: element.fingerprint },
+      })
+      return view
+    })
+    const digest = observationDigest({
+      url: providerObservation.url,
+      title: providerObservation.title,
+      text: providerObservation.text,
+      elements,
+    })
+    const observation: BrowserObservation = {
+      id: BrowserObservationId(`observation-${randomUUID()}`),
+      environmentId: this.slot.environmentId,
+      generation: this.generation,
+      pageId: providerObservation.pageId,
+      revision: this.revision,
+      url: providerObservation.url,
+      title: providerObservation.title,
+      text: providerObservation.text,
+      truncated: providerObservation.truncated,
+      elements,
+      digest,
+    }
+    this.latest = observation
+    this.latestElements = bindings
+    return observation
+  }
+
+  private async actNow(action: BrowserAction, signal: AbortSignal): Promise<BrowserTransition> {
+    const before = this.latest ?? await this.observeNow(signal)
+    const providerAction = this.resolveAction(action, before)
+    const recorded = recordedAction(action)
+    const startedAt = new Date().toISOString()
+    let after: BrowserObservation | undefined
+    let actionCompleted = false
+    let failure: unknown
+    try {
+      await this.backend.act(providerAction, signal)
+      actionCompleted = true
+      after = await this.observeNow(signal)
+    } catch (error: unknown) {
+      failure = error
+      if (!signal.aborted) {
+        try {
+          after = await this.observeNow(signal)
+        } catch (_postFailureObservationError) {
+          // The original provider failure remains authoritative; transition evidence records no after state.
+        }
+      }
+    }
+
+    const outcome = failure === undefined ? 'succeeded' : actionCompleted ? 'unknown' : 'failed'
+    const transition: BrowserTransition = {
+      id: BrowserTransitionId(`transition-${randomUUID()}`),
+      sessionId: this.slot.sessionId,
+      environmentId: this.slot.environmentId,
+      providerId: this.provider.id,
+      generation: this.generation,
+      action: recorded,
+      outcome,
+      before,
+      ...(after === undefined ? {} : { after }),
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      ...(failure === undefined ? {} : { error: errorEvidence(failure) }),
+    }
+    await this.runtime.persistTransition(transition)
+    if (failure !== undefined) {
+      if (signal.aborted) signal.throwIfAborted()
+      throw translateProviderFailure(failure, transition.id, actionCompleted)
+    }
+    return transition
+  }
+
+  private resolveAction(action: BrowserAction, before: BrowserObservation): BrowserProviderAction {
+    if (action.type === 'navigate') {
+      let parsed: URL
+      try {
+        parsed = new URL(action.url)
+      } catch (error: unknown) {
+        throw new BrowserRuntimeError(`invalid browser URL: ${action.url}`, 'BROWSER_INVALID_URL', { cause: error })
+      }
+      if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || parsed.username !== '' || parsed.password !== '') {
+        throw new BrowserRuntimeError(
+          'browser navigation requires an HTTP(S) URL without embedded credentials',
+          'BROWSER_INVALID_URL',
+        )
+      }
+      return action
+    }
+    if (action.observationId !== before.id) {
+      throw new BrowserRuntimeError(
+        `observation "${action.observationId}" is stale; observe the page again`,
+        'BROWSER_STALE_REFERENCE',
+      )
+    }
+    const element = this.latestElements.get(action.elementRef)
+    if (element === undefined) {
+      throw new BrowserRuntimeError(
+        `element "${action.elementRef}" does not belong to the latest observation`,
+        'BROWSER_STALE_REFERENCE',
+      )
+    }
+    if (action.type === 'click') return { type: 'click', target: element.provider }
+    if (element.view.inputType?.toLowerCase() === 'password') {
+      throw new BrowserRuntimeError(
+        'browser_fill refuses password inputs; v0.1 tool arguments are retained in the session log',
+        'BROWSER_PASSWORD_INPUT_FORBIDDEN',
+      )
+    }
+    return { type: 'fill', target: element.provider, value: action.value }
+  }
+
+  private async runShutdown(persistence: BrowserPersistence): Promise<void> {
+    this.queue.close()
+    await this.queue.drain()
+    const failures: unknown[] = []
+    if (persistence === 'resume') {
+      try {
+        await this.runtime.persistCheckpoint(
+          this.slot,
+          this.provider,
+          this.generation,
+          this.backend,
+          AbortSignal.timeout(this.runtime.cleanupTimeout()),
+        )
+      } catch (error: unknown) {
+        failures.push(error)
+      }
+    }
+    try {
+      await this.backend.close()
+    } catch (error: unknown) {
+      failures.push(error)
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `browser environment "${this.slot.environmentId}" cleanup failed`)
+    }
+  }
+}
+
+function resolveConfig(config: Config): ResolvedConfig {
+  const maxTextChars = config.maxTextChars ?? 60_000
+  const maxTransitionsInMemory = config.maxTransitionsInMemory ?? 500
+  const cleanupTimeoutMs = config.cleanupTimeoutMs ?? 10_000
+  for (const [key, value] of Object.entries({ maxTextChars, maxTransitionsInMemory, cleanupTimeoutMs })) {
+    if (!Number.isInteger(value) || value < 1) throw new Error(`browser-runtime: ${key} must be a positive integer`)
+  }
+  return {
+    ...(config.provider === undefined ? {} : { provider: BrowserProviderId(config.provider) }),
+    maxTextChars,
+    maxTransitionsInMemory,
+    cleanupTimeoutMs,
+  }
+}
+
+function requiredCapability(capabilities: BrowserProviderCapabilities, capability: BrowserCapability): boolean {
+  switch (capability) {
+    case 'checkpoint': return capabilities.checkpoint
+    case 'screenshot': return capabilities.screenshot
+    case 'multiple-pages': return capabilities.multiplePages
+    case 'attach-existing': return capabilities.attachExisting
+    case 'persistent-profile': return capabilities.persistentProfile
+    case 'network-events': return capabilities.networkEvents
+  }
+}
+
+function assertCapabilities(capabilities: BrowserProviderCapabilities, required: readonly BrowserCapability[]): void {
+  const missing = required.filter(capability => !requiredCapability(capabilities, capability))
+  if (missing.length > 0) {
+    throw new BrowserRuntimeError(
+      `browser provider does not support required capabilities: ${missing.join(', ')}`,
+      'BROWSER_CAPABILITY_UNSUPPORTED',
+    )
+  }
+}
+
+async function providerAvailable(provider: BrowserProvider): Promise<boolean> {
+  try {
+    return await provider.available()
+  } catch (_providerAvailabilityFailure) {
+    return false
+  }
+}
+
+function observationDigest(input: {
+  url: string
+  title: string
+  text: string
+  elements: readonly BrowserElement[]
+}): string {
+  return createHash('sha256').update(JSON.stringify(input)).digest('hex')
+}
+
+function recordedAction(action: BrowserAction): BrowserRecordedAction {
+  switch (action.type) {
+    case 'navigate': return { type: 'navigate', url: action.url }
+    case 'click': return { type: 'click', elementRef: action.elementRef }
+    case 'fill': return {
+      type: 'fill',
+      elementRef: action.elementRef,
+      value: '[REDACTED]',
+      valueLength: action.value.length,
+    }
+  }
+}
+
+function translateProviderFailure(
+  error: unknown,
+  transitionId: BrowserTransitionId,
+  actionCompleted: boolean,
+): BrowserRuntimeError {
+  if (error instanceof BrowserRuntimeError) return error
+  if (error instanceof BrowserProviderTargetStaleError) {
+    return new BrowserRuntimeError(
+      `${error.message}; transition ${transitionId}`,
+      'BROWSER_STALE_REFERENCE',
+      { cause: error },
+    )
+  }
+  if (error instanceof BrowserProviderPolicyError) {
+    return new BrowserRuntimeError(
+      `${error.message}; transition ${transitionId}`,
+      'BROWSER_POLICY_DENIED',
+      { cause: error },
+    )
+  }
+  return new BrowserRuntimeError(
+    `browser action ${actionCompleted ? 'completed but its after-state was not observed' : 'failed'}; transition ${transitionId}`,
+    actionCompleted ? 'BROWSER_ACTION_EVIDENCE_FAILED' : 'BROWSER_ACTION_FAILED',
+    { cause: error },
+  )
+}
+
+export { EMPTY_CAPABILITIES }

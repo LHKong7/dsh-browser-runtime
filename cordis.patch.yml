@@ -1,0 +1,24 @@
+- insert:
+    - id: browser-runtime
+      name: dsh-browser-runtime
+      config:
+        provider: playwright
+        maxTextChars: 60000
+        maxTransitionsInMemory: 500
+        cleanupTimeoutMs: 10000
+
+    - id: browser-playwright
+      name: dsh-browser-runtime/playwright
+      config:
+        headless: true
+        navigationTimeoutMs: 30000
+        actionTimeoutMs: 10000
+        maxElements: 100
+        allowPrivateNetwork: false
+
+    - id: tool-browser
+      name: dsh-browser-runtime/tools
+      config:
+        provider: playwright
+        persistence: ephemeral
+        timeoutMs: 30000

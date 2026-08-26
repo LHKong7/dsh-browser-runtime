@@ -1,0 +1,135 @@
+# dsh-browser-runtime
+
+[English](README.md) | 中文
+
+`dsh-browser-runtime` 为每个 DeepSeek Harness Agent 提供有租约、有状态的浏览器环境。它负责 Provider 选择、Agent 隔离、生命周期、操作串行化、过期引用检查、checkpoint 索引和 transition 证据；Playwright 只是该 API 后面的一个 Provider，模型工具则是独立 Consumer。
+
+仓库是一个可安装的 DSH bundle，包含三个插件入口：
+
+| 入口 | 角色 | Service 或工具 |
+|---|---|---|
+| `dsh-browser-runtime` | Service Definition 与控制面 | `ctx.browserRuntime` |
+| `dsh-browser-runtime/playwright` | Playwright/Chromium Provider | Provider id `playwright` |
+| `dsh-browser-runtime/tools` | 面向模型的 Consumer | 五个 `browser_*` 工具 |
+
+单包结构支持 `dsh plugin add github:...`。源码仍按三个角色分目录；如果它们以后需要独立发布节奏，可以直接拆成不同 npm 包。
+
+## v0.1 行为
+
+- 每个精确 Agent 对象拥有一个隔离 BrowserContext 和一个 Page。
+- 同一 owner 的并发 acquire 共享初始化并返回独立 lease；不同 owner 永不共享环境。
+- 同一环境的操作按 FIFO 执行；不同环境可以并行。
+- 每次 observation 生成 `e1` 之类的局部引用；只有最新 observation 的引用可以执行。
+- `navigate`、`click`、`fill` 生成 before/after transition 证据；fill 内容不会写入 Runtime 证据。
+- 截图通过 `ctx.attachments` 保存为 PNG，模型不能指定宿主机路径。
+- `resume` 保存 cookie 和 localStorage；恢复后 generation 增加，旧 page、observation、element 身份全部失效。
+- 最后一个 lease 释放、Agent 销毁、Provider 卸载和 Runtime 卸载都会等待浏览器资源清理完成。
+
+模型工具：
+
+| 工具 | 用途 |
+|---|---|
+| `browser_open` | 打开 HTTP(S) URL 并返回 observation |
+| `browser_observe` | 刷新页面文本和交互元素引用 |
+| `browser_click` | 点击最新 observation 中的引用 |
+| `browser_fill` | 向非密码输入项写入非敏感文本 |
+| `browser_screenshot` | 保存视口或整页 PNG attachment |
+
+## 开发与测试
+
+需要 Node.js `^22.19` 或 `>=24`，以及 pnpm 10。
+
+```sh
+pnpm install
+pnpm exec playwright install chromium
+pnpm run typecheck
+pnpm test
+pnpm run build
+pnpm pack
+```
+
+如果 Playwright 管理的 Chromium 存在，`pnpm test` 会启动真实本地 HTTP server 和 Chromium；没有 Chromium 时 Playwright 测试会自行跳过，CI 会明确安装 Chromium。
+
+## 安装到 DeepSeek Harness
+
+本地源码建议先打 tarball，再安装到 profile：
+
+```sh
+pnpm install
+pnpm exec playwright install chromium
+pnpm pack
+dsh plugin --profile browser add ./dsh-browser-runtime-0.1.0.tgz
+dsh plugin --profile browser exec playwright install chromium
+dsh --profile browser --dump-config
+```
+
+从 GitHub 安装时应固定 commit：
+
+```sh
+dsh plugin --profile browser add github:YOUR_ACCOUNT/dsh-browser-runtime#COMMIT_SHA
+dsh plugin --profile browser exec playwright install chromium
+```
+
+Git 安装会执行本包的 `prepare` 构建。pnpm 10 默认拒绝该脚本，需要在 profile 的 `pnpm-workspace.yaml` 中允许精确包名：
+
+```yaml
+allowBuilds:
+  dsh-browser-runtime: true
+```
+
+授权构建前应审查并固定源码。发布到 npm 的包或 tarball 已携带构建产物，不需要该授权。
+
+## 配置
+
+Bundle 的 [`cordis.patch.yml`](cordis.patch.yml) 默认选择 Playwright、使用 ephemeral Agent 环境、阻止私网访问，并注册全部五个工具。用户 profile 可以按 id 替换任意行；DSH patch 会替换整段 `config`，因此覆盖时必须重述该行的全部字段。
+
+Runtime 行：
+
+```yaml
+- id: browser-runtime
+  config:
+    provider: playwright
+    maxTextChars: 60000
+    maxTransitionsInMemory: 500
+    cleanupTimeoutMs: 10000
+```
+
+Playwright 行：
+
+```yaml
+- id: browser-playwright
+  config:
+    headless: true
+    navigationTimeoutMs: 30000
+    actionTimeoutMs: 10000
+    maxElements: 100
+    allowPrivateNetwork: false
+    # executablePath: /absolute/path/to/chromium
+    # checkpointRoot: /private/absolute/path
+```
+
+工具行：
+
+```yaml
+- id: tool-browser
+  config:
+    provider: playwright
+    persistence: ephemeral # 或 resume
+    timeoutMs: 30000
+```
+
+`persistence: resume` 可以在同一进程内从 Runtime 内存索引恢复。跨进程恢复还需要 DSH 的 `ctx.storageDomain`，Web profile 已经挂载该服务。Checkpoint 元数据写入 `browser_runtime` domain；Playwright 的敏感 storage-state payload 以 owner-only 权限存放在 `$DSH_HOME/browser-runtime/providers/playwright/v1/checkpoints`。
+
+## 安全限制
+
+默认 Provider 使用临时隔离的浏览器 profile 和经过清理的私有 `HOME`，阻止 service worker，不提供下载、上传、任意模型 JavaScript、模型 selector 或连接用户 Chrome profile 的 API。导航只接受不含内嵌凭据的 HTTP(S) URL；除非明确启用 `allowPrivateNetwork`，DNS 解析得到的 loopback、private、link-local、reserved 和 multicast 地址都会被拒绝。
+
+`browser_fill` 不是秘密输入通道。DSH 会在插件执行前记录原始 tool-call 参数，因此写入 `value` 的秘密仍会进入 Session log，即使 Runtime transition 证据已经隐藏该值。密码输入框会被直接拒绝。
+
+DNS 检查无法证明解析后的 DNS rebinding 安全。它只能降低应用层 SSRF 风险，不能替代网络 sandbox；需要硬边界时应使用宿主机防火墙或容器网络策略。
+
+## v0.1 不包含
+
+多页面、popup 接管、下载、上传、任意 JavaScript、连接真实 Chrome、跨 Provider checkpoint 转换、IndexedDB/sessionStorage 恢复、凭据管理，以及通用的非浏览器 Environment API。Playwright 管理的 Chromium 需要单独安装。
+
+Provider 扩展、所有权、失败与证据规则见[架构说明](docs/architecture.zh.md)。
