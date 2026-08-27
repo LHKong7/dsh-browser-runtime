@@ -382,7 +382,7 @@ export class BrowserRuntime extends Service {
     }
 
     let restored = checkpoint
-    const generation = restored === undefined ? 1 : restored.generation + 1
+    let generation = restored === undefined ? 1 : restored.generation + 1
     let backend: BrowserProviderEnvironment
     if (restored === undefined) {
       backend = await provider.open({ environmentId: slot.environmentId, sessionId: slot.sessionId, signal })
@@ -404,6 +404,9 @@ export class BrowserRuntime extends Service {
         )
         await this.forgetCheckpoint(slot.sessionId, restored)
         restored = undefined
+        // A session with no stored state starts at generation 1, exactly as a
+        // first acquire would.
+        generation = 1
         signal.throwIfAborted()
         backend = await provider.open({ environmentId: slot.environmentId, sessionId: slot.sessionId, signal })
       }
@@ -427,7 +430,7 @@ export class BrowserRuntime extends Service {
       await backend.close()
       throw new BrowserRuntimeError('browser environment is closing', 'BROWSER_ENVIRONMENT_CLOSED')
     }
-    return new ActiveEnvironment(this, slot, provider, backend, restored === undefined ? 1 : generation)
+    return new ActiveEnvironment(this, slot, provider, backend, generation)
   }
 
   private async resolveProvider(

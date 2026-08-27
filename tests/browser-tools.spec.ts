@@ -29,6 +29,8 @@ interface ActionResult {
 
 interface ExtractionResult {
   kind: string
+  url: string
+  observation_id?: string
   columns: string[]
   rows: Record<string, string>[]
   total: number
@@ -349,6 +351,8 @@ describe('structured extraction', () => {
     expect(result.isError).toBe(false)
     const value = result.value as unknown as ExtractionResult
     expect(value.kind).toBe('list')
+    expect(value.url).toBe(observation.url)
+    expect(value.observation_id).toBe(observation.id)
     expect(value.columns).toEqual(['index', 'title', 'url', 'text'])
     expect(value.rows).toHaveLength(3)
     expect(value.total).toBe(3)
@@ -359,6 +363,8 @@ describe('structured extraction', () => {
     const result = await harness.call('browser_extract_links', { fields: ['title', 'url'] })
     expect(result.isError).toBe(false)
     const value = result.value as unknown as ExtractionResult
+    // No region was named, so no observation id is echoed back.
+    expect(value.observation_id).toBeUndefined()
     expect(value.columns).toEqual(['title', 'url'])
     expect(Object.keys(value.rows[0] ?? {})).toEqual(['title', 'url'])
   })

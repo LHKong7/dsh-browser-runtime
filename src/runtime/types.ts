@@ -566,6 +566,8 @@ export interface BrowserProviderExtractRequest {
 /** Structured content one extraction produced. */
 export interface BrowserExtraction {
   readonly kind: BrowserExtractionKind
+  /** URL of the page the extraction read. */
+  readonly url: string
   /** Column names in row order; table extraction derives them from the header. */
   readonly columns: readonly string[]
   readonly rows: readonly BrowserExtractionRow[]

@@ -818,6 +818,7 @@ class PlaywrightEnvironment implements BrowserProviderEnvironment {
       })
       return {
         kind: request.kind,
+        url: page.url(),
         columns: result.columns,
         rows: result.rows,
         total: result.total,

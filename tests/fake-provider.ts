@@ -283,7 +283,14 @@ export class FakeEnvironment implements BrowserProviderEnvironment {
       url: `${this.url}#${index}`,
       text: `Body of record ${index}`.slice(0, request.maxTextChars),
     }))
-    return Promise.resolve({ kind: request.kind, columns, rows, total: 3, truncated: rows.length < 3 })
+    return Promise.resolve({
+      kind: request.kind,
+      url: this.url,
+      columns,
+      rows,
+      total: 3,
+      truncated: rows.length < 3,
+    })
   }
 
   screenshot({ signal }: { fullPage: boolean; signal: AbortSignal }): Promise<Uint8Array> {

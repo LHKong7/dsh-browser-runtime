@@ -178,6 +178,7 @@ describe.skipIf(!hasChromium)('observation ranking and extraction in a real brow
       limit: 5,
     })
     expect(extraction.kind).toBe('list')
+    expect(extraction.url).toBe(`${baseUrl}/list`)
     expect(extraction.total).toBe(PAPERS)
     expect(extraction.truncated).toBe(true)
     expect(extraction.rows).toHaveLength(5)

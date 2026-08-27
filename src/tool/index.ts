@@ -188,7 +188,7 @@ const extractionSchema = {
   properties: {
     kind: { type: 'string' as const, required: true, enum: ['list', 'table', 'links', 'article'] },
     url: { type: 'string' as const, required: true },
-    observation_id: { type: 'string' as const, required: true },
+    observation_id: { type: 'string' as const },
     columns: { type: 'array' as const, required: true, items: { type: 'string' as const } },
     rows: {
       type: 'array' as const,
@@ -534,7 +534,15 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   const defaultBudget = (): ObservationBudget => budgetFor({})
 
-  /** Register one tool whose body performs a single browser action. */
+  /**
+   * Register one tool whose body performs a single browser action.
+   *
+   * `parameters` and `build` are matched by hand: the helper erases the schema
+   * type so one registration path can serve every action, so a new tool must
+   * keep its `build` signature in step with the schema it declares. The
+   * integration suite calls each registered tool through the real ToolRuntime,
+   * which is what catches a mismatch.
+   */
   const action = (definition: {
     name: string
     description: string
@@ -927,10 +935,11 @@ function registerExtraction(
           signal: exec.signal,
         })
         const columns = selectColumns(extraction.columns, args.fields)
+        binding.lastUrl = extraction.url
         return {
           kind,
-          url: binding.lastUrl ?? '',
-          observation_id: args.observation_id ?? '',
+          url: extraction.url,
+          ...(args.observation_id === undefined ? {} : { observation_id: args.observation_id }),
           columns,
           rows: extraction.rows.map(row => Object.fromEntries(
             columns.map(column => [column, row[column] ?? '']),
