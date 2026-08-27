@@ -18,6 +18,7 @@ import type {
   BrowserTransition,
 } from '../runtime/types.ts'
 import type {} from '../runtime/runtime.ts'
+import { waitWithSignal } from '../runtime/serial.ts'
 import { formatObservation, observationValue, screenshotContent } from './format.ts'
 
 /** Cordis plugin name. */
@@ -124,6 +125,7 @@ class AgentBrowserBinding {
   private readonly controller = new AbortController()
   private leasePromise: Promise<BrowserEnvironmentLease> | undefined
   private lease: BrowserEnvironmentLease | undefined
+  private leaseCleanup: Promise<void> | undefined
   private disposal: Promise<void> | undefined
   private disposed = false
 
@@ -139,18 +141,19 @@ class AgentBrowserBinding {
   async get(signal: AbortSignal): Promise<BrowserEnvironmentLease> {
     if (this.disposed) throw new Error('browser tool binding is disposed')
     signal.throwIfAborted()
+    if (this.leaseCleanup !== undefined) await waitWithSignal(this.leaseCleanup, signal)
+    if (this.disposed) throw new Error('browser tool binding is disposed')
     if (this.lease !== undefined) return this.lease
     if (this.leasePromise === undefined) {
       const requiredCapabilities = this.config.persistence === 'resume'
         ? ['screenshot', 'checkpoint'] as const
         : ['screenshot'] as const
-      const acquisitionSignal = AbortSignal.any([this.controller.signal, signal])
       this.leasePromise = this.ctx.browserRuntime.acquire({
         owner: this.agent,
         sessionId: BrowserSessionId(String(this.agent.id)),
         persistence: this.config.persistence,
         requiredCapabilities,
-        signal: acquisitionSignal,
+        signal: this.controller.signal,
         ...(this.config.provider === undefined ? {} : { providerId: this.config.provider }),
       }).then((lease) => {
         this.lease = lease
@@ -160,13 +163,37 @@ class AgentBrowserBinding {
         throw error
       })
     }
-    return this.leasePromise
+    return waitWithSignal(this.leasePromise, signal)
+  }
+
+  async use<T>(
+    signal: AbortSignal,
+    operation: (lease: BrowserEnvironmentLease) => Promise<T>,
+  ): Promise<T> {
+    const lease = await this.get(signal)
+    try {
+      return await operation(lease)
+    } catch (error: unknown) {
+      if (signal.aborted) await this.invalidate(lease)
+      throw error
+    }
+  }
+
+  private invalidate(lease: BrowserEnvironmentLease): Promise<void> {
+    if (this.lease !== lease) return this.leaseCleanup ?? Promise.resolve()
+    this.lease = undefined
+    this.leasePromise = undefined
+    this.leaseCleanup = lease.release().catch((error: unknown) => {
+      this.ctx.logger.warn(`cancelled browser lease cleanup failed: ${String(error)}`)
+    })
+    return this.leaseCleanup
   }
 
   dispose(): Promise<void> {
     this.disposal ??= (async () => {
       this.disposed = true
       this.controller.abort(new Error('browser tool binding is disposing'))
+      if (this.leaseCleanup !== undefined) await this.leaseCleanup
       let lease = this.lease
       if (lease === undefined && this.leasePromise !== undefined) {
         try { lease = await this.leasePromise } catch (_acquisitionFailure) {
@@ -187,7 +214,11 @@ class AgentBrowserBindings {
 
   constructor(private readonly ctx: Context, private readonly config: ResolvedConfig) {}
 
-  get(agent: Agent | undefined, signal: AbortSignal): Promise<BrowserEnvironmentLease> {
+  use<T>(
+    agent: Agent | undefined,
+    signal: AbortSignal,
+    operation: (lease: BrowserEnvironmentLease) => Promise<T>,
+  ): Promise<T> {
     if (agent === undefined) throw new Error('browser tools require an Agent-owned execution')
     let binding = this.bindings.get(agent)
     if (binding === undefined) {
@@ -198,7 +229,7 @@ class AgentBrowserBindings {
       this.bindings.set(agent, binding)
       this.live.add(binding)
     }
-    return binding.get(signal)
+    return binding.use(signal, operation)
   }
 
   async dispose(): Promise<void> {
@@ -268,8 +299,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     output: { schema: actionResultSchema, render: (_args, value) => actionContent(value) },
     timeoutMs: resolved.timeoutMs,
     async execute(args, exec) {
-      const lease = await bindings.get(exec.agent, exec.signal)
-      return successfulAction(await lease.act({ type: 'navigate', url: args.url }, exec.signal))
+      return bindings.use(exec.agent, exec.signal, async lease => (
+        successfulAction(await lease.act({ type: 'navigate', url: args.url }, exec.signal))
+      ))
     },
   }))
 
@@ -287,8 +319,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
     timeoutMs: resolved.timeoutMs,
     async execute(_args, exec) {
-      const lease = await bindings.get(exec.agent, exec.signal)
-      return { observation: observationValue(await lease.observe(exec.signal)) }
+      return bindings.use(exec.agent, exec.signal, async lease => ({
+        observation: observationValue(await lease.observe(exec.signal)),
+      }))
     },
   }))
 
@@ -302,12 +335,13 @@ export function apply(ctx: Context, config: Config = {}): void {
     output: { schema: actionResultSchema, render: (_args, value) => actionContent(value) },
     timeoutMs: resolved.timeoutMs,
     async execute(args, exec) {
-      const lease = await bindings.get(exec.agent, exec.signal)
-      return successfulAction(await lease.act({
-        type: 'click',
-        observationId: BrowserObservationId(args.observation_id),
-        elementRef: BrowserElementRef(args.element_ref),
-      }, exec.signal))
+      return bindings.use(exec.agent, exec.signal, async lease => (
+        successfulAction(await lease.act({
+          type: 'click',
+          observationId: BrowserObservationId(args.observation_id),
+          elementRef: BrowserElementRef(args.element_ref),
+        }, exec.signal))
+      ))
     },
   }))
 
@@ -322,13 +356,14 @@ export function apply(ctx: Context, config: Config = {}): void {
     output: { schema: actionResultSchema, render: (_args, value) => actionContent(value) },
     timeoutMs: resolved.timeoutMs,
     async execute(args, exec) {
-      const lease = await bindings.get(exec.agent, exec.signal)
-      return successfulAction(await lease.act({
-        type: 'fill',
-        observationId: BrowserObservationId(args.observation_id),
-        elementRef: BrowserElementRef(args.element_ref),
-        value: args.value,
-      }, exec.signal))
+      return bindings.use(exec.agent, exec.signal, async lease => (
+        successfulAction(await lease.act({
+          type: 'fill',
+          observationId: BrowserObservationId(args.observation_id),
+          elementRef: BrowserElementRef(args.element_ref),
+          value: args.value,
+        }, exec.signal))
+      ))
     },
   }))
 
@@ -353,8 +388,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
     timeoutMs: resolved.timeoutMs,
     async execute(args, exec) {
-      const lease = await bindings.get(exec.agent, exec.signal)
-      const screenshot = await lease.screenshot({ fullPage: args.full_page ?? false, signal: exec.signal })
+      const screenshot = await bindings.use(exec.agent, exec.signal, lease => (
+        lease.screenshot({ fullPage: args.full_page ?? false, signal: exec.signal })
+      ))
       const attachment = await ctx.attachments.saveImage({
         data: screenshot.data,
         mediaType: 'image/png',

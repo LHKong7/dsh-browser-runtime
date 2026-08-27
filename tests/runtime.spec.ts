@@ -1,10 +1,12 @@
 import { Context } from '@deepseek-ai/cordis'
-import { describe, expect, it } from 'vitest'
+import { setTimeout as delay } from 'node:timers/promises'
+import { describe, expect, it, vi } from 'vitest'
 import BrowserRuntime, {
   BrowserProviderId,
   BrowserRuntimeError,
   BrowserSessionId,
 } from 'dsh-browser-runtime'
+import type { BrowserProvider, BrowserProviderEnvironment } from 'dsh-browser-runtime'
 import { FakeBrowserProvider } from './fake-provider.ts'
 
 const signal = new AbortController().signal
@@ -17,6 +19,90 @@ async function harness(provider = new FakeBrowserProvider()) {
 }
 
 describe('BrowserRuntime provider selection and ownership', () => {
+  it('rejects an incomplete checkpoint provider during registration', async () => {
+    const ctx = new Context()
+    const runtimeFiber = await ctx.plugin(BrowserRuntime)
+    const provider: BrowserProvider = {
+      id: BrowserProviderId('incomplete-checkpoint'),
+      capabilities: {
+        checkpoint: true,
+        screenshot: false,
+        multiplePages: false,
+        attachExisting: false,
+        persistentProfile: false,
+        networkEvents: false,
+      },
+      available: () => true,
+      open: () => Promise.reject(new Error('not reached')),
+    }
+
+    expect(() => ctx.browserRuntime.registerProvider(provider)).toThrowError(expect.objectContaining({
+      code: 'BROWSER_CHECKPOINT_UNAVAILABLE',
+    }))
+    await runtimeFiber.dispose()
+  })
+
+  it('closes a checkpoint provider environment that omits checkpoint()', async () => {
+    const ctx = new Context()
+    const runtimeFiber = await ctx.plugin(BrowserRuntime)
+    let closes = 0
+    const environment: BrowserProviderEnvironment = {
+      observe: () => Promise.reject(new Error('not reached')),
+      act: () => Promise.reject(new Error('not reached')),
+      screenshot: () => Promise.reject(new Error('not reached')),
+      close: () => { closes += 1; return Promise.resolve() },
+    }
+    const provider: BrowserProvider = {
+      id: BrowserProviderId('incomplete-environment'),
+      capabilities: {
+        checkpoint: true,
+        screenshot: false,
+        multiplePages: false,
+        attachExisting: false,
+        persistentProfile: false,
+        networkEvents: false,
+      },
+      available: () => true,
+      open: () => Promise.resolve(environment),
+      restore: () => Promise.resolve(environment),
+      destroyCheckpoint: () => Promise.resolve(),
+    }
+    ctx.browserRuntime.registerProvider(provider)
+
+    await expect(ctx.browserRuntime.acquire({
+      owner: {},
+      sessionId: BrowserSessionId('incomplete-environment'),
+      persistence: 'ephemeral',
+      providerId: provider.id,
+    })).rejects.toMatchObject({ code: 'BROWSER_CHECKPOINT_UNAVAILABLE' })
+    expect(closes).toBe(1)
+
+    const cleanupFailure = new Error('rejected environment close failed')
+    const brokenEnvironment: BrowserProviderEnvironment = {
+      ...environment,
+      close: () => Promise.reject(cleanupFailure),
+    }
+    const brokenProvider: BrowserProvider = {
+      ...provider,
+      id: BrowserProviderId('incomplete-environment-close-failure'),
+      open: () => Promise.resolve(brokenEnvironment),
+      restore: () => Promise.resolve(brokenEnvironment),
+    }
+    ctx.browserRuntime.registerProvider(brokenProvider)
+    const aggregate = await ctx.browserRuntime.acquire({
+      owner: {},
+      sessionId: BrowserSessionId('incomplete-environment-close-failure'),
+      persistence: 'ephemeral',
+      providerId: brokenProvider.id,
+    }).then(() => undefined, error => error as AggregateError)
+    expect(aggregate).toBeInstanceOf(AggregateError)
+    expect(aggregate?.errors).toEqual([
+      expect.objectContaining({ code: 'BROWSER_CHECKPOINT_UNAVAILABLE' }),
+      cleanupFailure,
+    ])
+    await runtimeFiber.dispose()
+  })
+
   it('rejects duplicate and ambiguous providers without registration-order selection', async () => {
     const { ctx, runtimeFiber, provider } = await harness()
     expect(() => ctx.browserRuntime.registerProvider(provider)).toThrowError(BrowserRuntimeError)
@@ -27,6 +113,42 @@ describe('BrowserRuntime provider selection and ownership', () => {
       sessionId: BrowserSessionId('ambiguous'),
       persistence: 'ephemeral',
     })).rejects.toMatchObject({ code: 'BROWSER_PROVIDER_AMBIGUOUS' })
+    await runtimeFiber.dispose()
+  })
+
+  it.each([
+    { selection: 'configured', configured: true },
+    { selection: 'automatic', configured: false },
+  ])('does not open a $selection Provider after its registration starts disposing', async ({ configured }) => {
+    let releaseAvailability = () => {}
+    const availabilityBarrier = new Promise<void>((resolve) => { releaseAvailability = resolve })
+    const provider = new FakeBrowserProvider({ availabilityBarrier })
+    const { ctx, runtimeFiber, unregister } = await harness(provider)
+    const acquisition = ctx.browserRuntime.acquire({
+      owner: {},
+      sessionId: BrowserSessionId(`provider-removal-${configured ? 'configured' : 'automatic'}`),
+      persistence: 'ephemeral',
+      ...(configured ? { providerId: provider.id } : {}),
+    })
+    await vi.waitFor(() => { expect(provider.availabilityChecks).toBe(1) })
+
+    const removal = unregister()
+    await delay(10)
+    const disposesBeforeAvailabilitySettled = provider.disposes
+    releaseAvailability()
+    const outcome = await acquisition.then(async (lease) => {
+      await lease.release()
+      return { status: 'fulfilled' as const }
+    }, (error: unknown) => ({ status: 'rejected' as const, error }))
+    await removal
+
+    expect(disposesBeforeAvailabilitySettled).toBe(0)
+    expect(outcome).toMatchObject({
+      status: 'rejected',
+      error: { code: 'BROWSER_ENVIRONMENT_CLOSED' },
+    })
+    expect(provider.opens).toBe(0)
+    expect(provider.disposes).toBe(1)
     await runtimeFiber.dispose()
   })
 
@@ -52,6 +174,58 @@ describe('BrowserRuntime provider selection and ownership', () => {
     await second.release()
     expect(provider.environments[0]?.closes).toBe(1)
     await runtimeFiber.dispose()
+  })
+
+  it('keeps shared setup alive when one acquire caller cancels', async () => {
+    const provider = new FakeBrowserProvider({ openDelayMs: 40 })
+    const { ctx, runtimeFiber } = await harness(provider)
+    const owner = {}
+    const sessionId = BrowserSessionId('independent-acquire-cancellation')
+    const cancelled = new AbortController()
+    const first = ctx.browserRuntime.acquire({
+      owner,
+      sessionId,
+      persistence: 'ephemeral',
+      providerId: provider.id,
+      signal: cancelled.signal,
+    })
+    const second = ctx.browserRuntime.acquire({
+      owner,
+      sessionId,
+      persistence: 'ephemeral',
+      providerId: provider.id,
+    })
+
+    await delay(5)
+    cancelled.abort(new Error('first acquire cancelled'))
+
+    await expect(first).rejects.toThrow('first acquire cancelled')
+    const lease = await second
+    expect(provider.opens).toBe(1)
+    await lease.release()
+    await runtimeFiber.dispose()
+  })
+
+  it('treats last-waiter cancellation as successful setup rollback', async () => {
+    const provider = new FakeBrowserProvider({ openDelayMs: 40 })
+    const { ctx, runtimeFiber } = await harness(provider)
+    const warn = vi.spyOn(ctx.logger, 'warn')
+    const cancelled = new AbortController()
+    const acquisition = ctx.browserRuntime.acquire({
+      owner: {},
+      sessionId: BrowserSessionId('cancelled-owner-setup'),
+      persistence: 'ephemeral',
+      providerId: provider.id,
+      signal: cancelled.signal,
+    })
+
+    await delay(5)
+    cancelled.abort(new Error('only acquire cancelled'))
+
+    await expect(acquisition).rejects.toThrow('only acquire cancelled')
+    await runtimeFiber.dispose()
+    expect(provider.environments).toHaveLength(0)
+    expect(warn).not.toHaveBeenCalled()
   })
 
   it('isolates different owner objects even when they share a session id', async () => {
@@ -153,6 +327,69 @@ describe('BrowserRuntime observation, evidence, and concurrency', () => {
 })
 
 describe('BrowserRuntime checkpoint and teardown', () => {
+  it('keeps same-session checkpoint ordering when a queued caller cancels', async () => {
+    let releaseCheckpoint = () => {}
+    const checkpointBarrier = new Promise<void>((resolve) => { releaseCheckpoint = resolve })
+    const provider = new FakeBrowserProvider({ checkpointBarrier })
+    const { ctx, runtimeFiber } = await harness(provider)
+    const sessionId = BrowserSessionId('cancelled-checkpoint-waiter')
+    const first = await ctx.browserRuntime.acquire({
+      owner: {}, sessionId, persistence: 'ephemeral', providerId: provider.id,
+    })
+    const second = await ctx.browserRuntime.acquire({
+      owner: {}, sessionId, persistence: 'ephemeral', providerId: provider.id,
+    })
+    const third = await ctx.browserRuntime.acquire({
+      owner: {}, sessionId, persistence: 'ephemeral', providerId: provider.id,
+    })
+
+    const firstCheckpoint = first.checkpoint()
+    await vi.waitFor(() => {
+      expect(provider.environments.reduce((count, environment) => count + environment.checkpoints, 0)).toBe(1)
+    })
+    const controller = new AbortController()
+    const cancellation = new Error('cancelled queued checkpoint')
+    const cancelledCheckpoint = second.checkpoint(controller.signal)
+    await delay(5)
+    controller.abort(cancellation)
+    await expect(cancelledCheckpoint).rejects.toBe(cancellation)
+
+    const thirdCheckpoint = third.checkpoint()
+    await delay(10)
+    expect(provider.environments.reduce((count, environment) => count + environment.checkpoints, 0)).toBe(1)
+    releaseCheckpoint()
+    await Promise.all([firstCheckpoint, thirdCheckpoint])
+    expect(provider.environments.reduce((count, environment) => count + environment.checkpoints, 0)).toBe(2)
+
+    await Promise.all([first.release(), second.release(), third.release()])
+    await runtimeFiber.dispose()
+  })
+
+  it('rejects cross-provider checkpoint replacement before creating a payload', async () => {
+    const { ctx, runtimeFiber, provider } = await harness()
+    const other = new FakeBrowserProvider({ id: 'other' })
+    ctx.browserRuntime.registerProvider(other)
+    const sessionId = BrowserSessionId('cross-provider-checkpoint-replacement')
+    const first = await ctx.browserRuntime.acquire({
+      owner: {}, sessionId, persistence: 'resume', providerId: provider.id,
+    })
+    const second = await ctx.browserRuntime.acquire({
+      owner: {}, sessionId, persistence: 'resume', providerId: other.id,
+    })
+
+    await first.release()
+    const secondRelease = await second.release().catch((error: unknown) => error)
+    expect(secondRelease).toBeInstanceOf(AggregateError)
+    expect((secondRelease as AggregateError).errors).toMatchObject([{
+      code: 'BROWSER_CHECKPOINT_PROVIDER_MISMATCH',
+    }])
+    expect(ctx.browserRuntime.checkpointFor(sessionId)?.providerId).toBe(provider.id)
+    expect(other.environments[0]?.checkpoints).toBe(0)
+    expect(provider.destroyed).toEqual([])
+
+    await runtimeFiber.dispose()
+  })
+
   it('checkpoints on last release and restores with a new generation', async () => {
     const { ctx, runtimeFiber, provider } = await harness()
     const owner = {}

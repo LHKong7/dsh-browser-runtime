@@ -21,7 +21,7 @@ export type BrowserRuntimeErrorCode =
   | 'BROWSER_POLICY_DENIED'
   | 'BROWSER_ACTION_FAILED'
   | 'BROWSER_ACTION_EVIDENCE_FAILED'
-  | 'BROWSER_EVIDENCE_WRITE_FAILED'
+  | 'BROWSER_CHECKPOINT_METADATA_FAILED'
 
 /** Error with a stable code and optional cause for provider and tool integration. */
 export class BrowserRuntimeError extends HarnessError {

@@ -1,23 +1,23 @@
 /** Public identities, requests, results, and provider interfaces for browser environments. */
 
-type Brand<T, Name extends string> = T & { readonly __brand: Name }
+import type { Branded } from '@deepseek-ai/dsh-brand'
 
 /** Opaque provider registry identity. */
-export type BrowserProviderId = Brand<string, 'BrowserProviderId'>
+export type BrowserProviderId = Branded<'BrowserProviderId'>
 /** Opaque runtime environment identity. */
-export type BrowserEnvironmentId = Brand<string, 'BrowserEnvironmentId'>
+export type BrowserEnvironmentId = Branded<'BrowserEnvironmentId'>
 /** Opaque page identity inside one environment generation. */
-export type BrowserPageId = Brand<string, 'BrowserPageId'>
+export type BrowserPageId = Branded<'BrowserPageId'>
 /** Opaque observation identity. */
-export type BrowserObservationId = Brand<string, 'BrowserObservationId'>
+export type BrowserObservationId = Branded<'BrowserObservationId'>
 /** Observation-local model-facing element identity. */
-export type BrowserElementRef = Brand<string, 'BrowserElementRef'>
+export type BrowserElementRef = Branded<'BrowserElementRef'>
 /** Opaque transition identity. */
-export type BrowserTransitionId = Brand<string, 'BrowserTransitionId'>
+export type BrowserTransitionId = Branded<'BrowserTransitionId'>
 /** Opaque durable checkpoint reference. */
-export type BrowserCheckpointRef = Brand<string, 'BrowserCheckpointRef'>
+export type BrowserCheckpointRef = Branded<'BrowserCheckpointRef'>
 /** Durable session identity supplied by the caller. */
-export type BrowserSessionId = Brand<string, 'BrowserSessionId'>
+export type BrowserSessionId = Branded<'BrowserSessionId'>
 
 /** Brand a validated provider id. */
 export const BrowserProviderId = (value: string): BrowserProviderId => value as BrowserProviderId
@@ -70,7 +70,7 @@ export interface BrowserAcquireRequest {
   readonly persistence: BrowserPersistence
   /** Provider features the caller requires. */
   readonly requiredCapabilities?: readonly BrowserCapability[]
-  /** Caller cancellation for acquisition. */
+  /** Cancel this acquisition wait without cancelling another compatible waiter. */
   readonly signal?: AbortSignal
 }
 
@@ -192,11 +192,19 @@ export interface BrowserEnvironmentLease {
   readonly generation: number
   /** Observe the current page and invalidate older element refs. */
   observe(signal?: AbortSignal): Promise<BrowserObservation>
-  /** Perform one serialized action and return its transition evidence. */
+  /**
+   * Perform one serialized action and return its transition evidence.
+   * Auxiliary compact-index failures are logged without changing the action result.
+   */
   act(action: BrowserAction, signal?: AbortSignal): Promise<BrowserTransition>
-  /** Capture a PNG without exposing a host output path. */
+  /** Capture a PNG without exposing a host output path; Provider resource limits reject with `BROWSER_POLICY_DENIED`. */
   screenshot(options?: BrowserScreenshotOptions): Promise<BrowserScreenshot>
-  /** Persist the provider-supported browser state without closing the environment. */
+  /**
+   * Persist provider-supported state without closing the environment.
+   * Checkpoints sharing a session id commit serially across owner environments.
+   * Cancelling a queued call does not let a later checkpoint bypass active work.
+   * A Provider cannot replace another Provider's checkpoint for the session.
+   */
   checkpoint(signal?: AbortSignal): Promise<BrowserCheckpointRecord>
   /** Release this holder; the last release checkpoints when configured and closes the environment. */
   release(): Promise<void>
@@ -260,7 +268,7 @@ export interface BrowserProviderEnvironment {
   act(action: BrowserProviderAction, signal: AbortSignal): Promise<void>
   /** Capture a PNG. */
   screenshot(options: { readonly fullPage: boolean; readonly signal: AbortSignal }): Promise<Uint8Array>
-  /** Persist provider state when checkpoint capability is advertised. */
+  /** Persist provider state; required when the Provider advertises checkpoint capability. */
   checkpoint?(signal: AbortSignal): Promise<BrowserProviderCheckpoint>
   /** Close every resource owned by this environment. Idempotent. */
   close(): Promise<void>
@@ -274,9 +282,9 @@ export interface BrowserProvider {
   available(): boolean | Promise<boolean>
   /** Open a fresh environment; the provider retains cleanup responsibility until fulfillment. */
   open(request: BrowserProviderOpenRequest): Promise<BrowserProviderEnvironment>
-  /** Restore an environment when checkpoint capability is advertised. */
+  /** Restore an environment; required when checkpoint capability is advertised. */
   restore?(request: BrowserProviderRestoreRequest): Promise<BrowserProviderEnvironment>
-  /** Delete provider payload for one no-longer-indexed checkpoint. */
+  /** Delete provider payload; required when checkpoint capability is advertised. */
   destroyCheckpoint?(ref: BrowserCheckpointRef): Promise<void>
   /** Close provider-wide resources after all owned environments drain. */
   dispose?(): Promise<void>

@@ -13,5 +13,16 @@ export default defineConfig({
     testTimeout: 30_000,
     hookTimeout: 30_000,
     restoreMocks: true,
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.ts'],
+      reporter: ['text'],
+      thresholds: {
+        statements: 75,
+        branches: 60,
+        functions: 80,
+        lines: 80,
+      },
+    },
   },
 })

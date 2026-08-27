@@ -1,5 +1,33 @@
 import { BrowserRuntimeError } from './error.ts'
 
+/**
+ * Wait for shared work while keeping caller cancellation local to this wait.
+ * The producer retains ownership of the promise and its lifecycle signal.
+ * @param promise - shared work owned by another lifecycle.
+ * @param signal - optional cancellation for this caller only.
+ * @returns the shared result or the caller's abort reason.
+ */
+export async function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return promise
+  signal.throwIfAborted()
+  let onAbort: (() => void) | undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      try {
+        signal.throwIfAborted()
+      } catch (error: unknown) {
+        reject(error)
+      }
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  try {
+    return await Promise.race([promise, aborted])
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  }
+}
+
 /** Per-environment FIFO executor with an explicit close-admission and drain sequence. */
 export class SerialExecutor {
   private tail: Promise<void> = Promise.resolve()

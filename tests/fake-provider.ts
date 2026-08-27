@@ -20,10 +20,14 @@ import type {
 interface FakeProviderOptions {
   readonly id?: string
   readonly capabilities?: Partial<BrowserProviderCapabilities>
+  readonly openDelayMs?: number
   readonly actionDelayMs?: number
+  readonly actionError?: Error
+  readonly checkpointBarrier?: Promise<void>
   readonly checkpointError?: Error
   readonly closeError?: Error
   readonly available?: boolean
+  readonly availabilityBarrier?: Promise<void>
 }
 
 interface FakeTarget {
@@ -39,6 +43,7 @@ export class FakeBrowserProvider implements BrowserProvider {
   opens = 0
   restores = 0
   disposes = 0
+  availabilityChecks = 0
   activeActions = 0
   maxActiveActions = 0
   private checkpointSequence = 0
@@ -58,18 +63,22 @@ export class FakeBrowserProvider implements BrowserProvider {
     }
   }
 
-  available(): boolean {
+  async available(): Promise<boolean> {
+    this.availabilityChecks += 1
+    await this.options.availabilityBarrier
     return this.options.available ?? true
   }
 
-  open(request: BrowserProviderOpenRequest): Promise<BrowserProviderEnvironment> {
+  async open(request: BrowserProviderOpenRequest): Promise<BrowserProviderEnvironment> {
     this.opens += 1
-    return Promise.resolve(this.makeEnvironment(request))
+    await this.waitForOpen(request.signal)
+    return this.makeEnvironment(request)
   }
 
-  restore(request: BrowserProviderRestoreRequest): Promise<BrowserProviderEnvironment> {
+  async restore(request: BrowserProviderRestoreRequest): Promise<BrowserProviderEnvironment> {
     this.restores += 1
-    return Promise.resolve(this.makeEnvironment(request))
+    await this.waitForOpen(request.signal)
+    return this.makeEnvironment(request)
   }
 
   destroyCheckpoint(ref: BrowserCheckpointRefType): Promise<void> {
@@ -92,6 +101,12 @@ export class FakeBrowserProvider implements BrowserProvider {
     this.maxActiveActions = Math.max(this.maxActiveActions, this.activeActions)
     await delay(this.options.actionDelayMs ?? 0)
     this.activeActions -= 1
+  }
+
+  private async waitForOpen(signal: AbortSignal): Promise<void> {
+    const delayMs = this.options.openDelayMs ?? 0
+    if (delayMs > 0) await delay(delayMs, undefined, { signal })
+    signal.throwIfAborted()
   }
 
   private makeEnvironment(request: BrowserProviderOpenRequest): FakeEnvironment {
@@ -163,6 +178,7 @@ export class FakeEnvironment implements BrowserProviderEnvironment {
     try {
       await this.provider.enterAction()
       signal.throwIfAborted()
+      if (this.options.actionError !== undefined) throw this.options.actionError
       if (action.type === 'navigate') {
         this.url = action.url
         this.title = 'Fake page'
@@ -184,14 +200,16 @@ export class FakeEnvironment implements BrowserProviderEnvironment {
     return Promise.resolve(Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10))
   }
 
-  checkpoint(signal: AbortSignal): Promise<BrowserProviderCheckpoint> {
+  async checkpoint(signal: AbortSignal): Promise<BrowserProviderCheckpoint> {
     signal.throwIfAborted()
     this.checkpoints += 1
-    if (this.options.checkpointError !== undefined) return Promise.reject(this.options.checkpointError)
-    return Promise.resolve({
+    await this.options.checkpointBarrier
+    signal.throwIfAborted()
+    if (this.options.checkpointError !== undefined) throw this.options.checkpointError
+    return {
       ref: this.provider.nextCheckpoint(),
       coverage: ['cookies', 'local-storage'],
-    })
+    }
   }
 
   close(): Promise<void> {

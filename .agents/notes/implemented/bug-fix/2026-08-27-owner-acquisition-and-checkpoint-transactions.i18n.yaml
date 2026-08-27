@@ -1,0 +1,4 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority.
+2026-08-27-owner-acquisition-and-checkpoint-transactions.md: fda9bd10471bd3b68d9c9f72d616aa26377eb638
+2026-08-27-owner-acquisition-and-checkpoint-transactions.zh.md: 42424a117bed0555086bb1879c50fd94f2b35a37

@@ -1,0 +1,4 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority.
+2026-08-27-preserve-action-outcome-on-transition-index-failure.md: 06da8ad5c219875b7dab8a42a60fa202e5c20ab2
+2026-08-27-preserve-action-outcome-on-transition-index-failure.zh.md: 24cd9049ca430ed927ce930c8717071b0019bf77
