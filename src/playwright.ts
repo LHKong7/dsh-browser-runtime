@@ -11,4 +11,3 @@ export {
   name,
 } from './provider/playwright.ts'
 export type { Config as PlaywrightBrowserConfig } from './provider/playwright.ts'
-export { default } from './provider/playwright.ts'

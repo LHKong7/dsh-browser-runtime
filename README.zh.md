@@ -44,35 +44,51 @@
 
 ```sh
 pnpm install
-pnpm exec playwright install chromium
+node lib/cli/index.js install chromium
 pnpm run typecheck
 pnpm run test:coverage
 pnpm run build
 pnpm run lint:package
-pnpm pack
+pnpm run verify:package
+pnpm run verify:tarball
 ```
 
 如果 Playwright 管理的 Chromium 存在，`pnpm test` 会启动真实本地 HTTP server 和 Chromium；没有 Chromium 时 Playwright 测试会自行跳过，CI 会明确安装 Chromium。
 
+`verify:package` 针对构建产物运行发布物门禁，`verify:tarball` 则先打包、解压，再针对 profile 实际安装的那份归档重跑一遍：每个 `exports` 子路径都能解析、函数式插件入口没有 default 导出、真实的 `Loader.unwrapExports` 保留了它们的 `inject`/`Config`/`name`、三个入口都能在真实 Cordis Context 中挂载、`doctor` 针对解压后的文件运行，并输出包版本、源码提交和入口的完整性摘要。
+
 ## 安装到 DeepSeek Harness
 
-本地源码建议先打 tarball，再安装到 profile：
+DSH profile 是 pnpm workspace 根，因此 `add` 需要 `-w`。插件自带浏览器安装程序和诊断命令，
+所以任何一步都不依赖 pnpm 把传递依赖 `playwright` 放在哪个目录：
+
+```sh
+dsh plugin --profile web add -w dsh-browser-runtime
+dsh-browser-runtime install chromium
+dsh-browser-runtime doctor
+```
+
+本地源码改为先打 tarball，再安装该路径：
 
 ```sh
 pnpm install
-pnpm exec playwright install chromium
 pnpm pack
-dsh plugin --profile browser add ./dsh-browser-runtime-0.1.1.tgz
-dsh plugin --profile browser exec playwright install chromium
-dsh --profile browser --dump-config
+dsh plugin --profile web add -w ./dsh-browser-runtime-0.1.2.tgz
+dsh-browser-runtime install chromium
+dsh-browser-runtime doctor
+dsh --profile web --dump-config
 ```
 
 从 GitHub 安装时应固定 commit：
 
 ```sh
-dsh plugin --profile browser add github:YOUR_ACCOUNT/dsh-browser-runtime#COMMIT_SHA
-dsh plugin --profile browser exec playwright install chromium
+dsh plugin --profile web add -w github:YOUR_ACCOUNT/dsh-browser-runtime#COMMIT_SHA
+dsh-browser-runtime install chromium
 ```
+
+`dsh-browser-runtime doctor` 会报告 Node 版本、插件版本、Playwright 版本、Chromium 是否存在
+及其实际路径、每个入口在 DSH Loader 眼中的导出形态、bundle patch 是否随包发布，以及 Provider
+是否可以打开环境。任何一项失败都会以非零码退出，profile 安装脚本可以据此设卡。
 
 Git 安装会执行本包的 `prepare` 构建。pnpm 10 默认拒绝该脚本，需要在 profile 的 `pnpm-workspace.yaml` 中允许精确包名：
 

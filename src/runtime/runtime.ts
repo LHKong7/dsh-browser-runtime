@@ -356,7 +356,7 @@ export class BrowserRuntime extends Service {
       }
       if (!available) {
         throw new BrowserRuntimeError(
-          `configured browser provider "${exactId}" is unavailable`,
+          withProviderRemedy(`configured browser provider "${exactId}" is unavailable`, await providerRemedy(provider)),
           'BROWSER_PROVIDER_CONFIGURED_UNAVAILABLE',
         )
       }
@@ -376,7 +376,15 @@ export class BrowserRuntime extends Service {
     } while (!sameProviderSnapshot(this.providers, candidates))
     if (available.length === 0) {
       delete slot.providerId
-      throw new BrowserRuntimeError('no browser provider is available', 'BROWSER_PROVIDER_UNAVAILABLE')
+      const remedies: string[] = []
+      for (const provider of candidates) {
+        const remedy = await providerRemedy(provider)
+        if (remedy !== undefined) remedies.push(`${provider.id}: ${remedy}`)
+      }
+      throw new BrowserRuntimeError(
+        withProviderRemedy('no browser provider is available', remedies.join('\n') || undefined),
+        'BROWSER_PROVIDER_UNAVAILABLE',
+      )
     }
     if (available.length > 1) {
       delete slot.providerId
@@ -889,6 +897,21 @@ async function providerAvailable(provider: BrowserProvider): Promise<boolean> {
   } catch (_providerAvailabilityFailure) {
     return false
   }
+}
+
+/** Read a provider's operator remedy without letting a broken provider mask the selection failure. */
+async function providerRemedy(provider: BrowserProvider): Promise<string | undefined> {
+  if (provider.unavailableReason === undefined) return undefined
+  try {
+    const reason = await provider.unavailableReason()
+    return reason === undefined || reason === '' ? undefined : reason
+  } catch (_providerDiagnosticFailure) {
+    return undefined
+  }
+}
+
+function withProviderRemedy(message: string, remedy: string | undefined): string {
+  return remedy === undefined ? message : `${message}\n${remedy}`
 }
 
 function sameProviderSnapshot(

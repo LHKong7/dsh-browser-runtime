@@ -408,4 +408,3 @@ export function apply(ctx: Context, config: Config = {}): void {
 
 export { formatObservation, observationValue } from './format.ts'
 export type { ObservationValue } from './format.ts'
-export default apply

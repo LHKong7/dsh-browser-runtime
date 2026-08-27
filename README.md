@@ -44,35 +44,54 @@ Prerequisites are Node.js `^22.19` or `>=24` and pnpm 10.
 
 ```sh
 pnpm install
-pnpm exec playwright install chromium
+node lib/cli/index.js install chromium
 pnpm run typecheck
 pnpm run test:coverage
 pnpm run build
 pnpm run lint:package
-pnpm pack
+pnpm run verify:package
+pnpm run verify:tarball
 ```
 
 `pnpm test` uses a real local HTTP server and Chromium when Playwright's managed browser is present. The Playwright suite self-skips when Chromium is absent; CI installs it explicitly.
 
+`verify:package` runs the artifact conformance gate over the built tree, and `verify:tarball` packs, extracts, and re-runs it over the exact archive a profile installs: every `exports` subpath resolves, the functional plugin entries carry no default export, the real `Loader.unwrapExports` keeps their `inject`/`Config`/`name`, all three entries mount in a real Cordis Context, `doctor` runs against the extracted files, and the report prints the package version, source commit, and an integrity digest of the entry points.
+
 ## Install into DeepSeek Harness
 
-For a local checkout, build a tarball and install it into a profile:
+A DSH profile is a pnpm workspace root, so `add` needs `-w`. The plugin ships its
+own browser installer and a diagnostic command, so no step depends on where pnpm
+happens to place the transitive `playwright` dependency:
+
+```sh
+dsh plugin --profile web add -w dsh-browser-runtime
+dsh-browser-runtime install chromium
+dsh-browser-runtime doctor
+```
+
+For a local checkout, build a tarball and install that path instead:
 
 ```sh
 pnpm install
-pnpm exec playwright install chromium
 pnpm pack
-dsh plugin --profile browser add ./dsh-browser-runtime-0.1.1.tgz
-dsh plugin --profile browser exec playwright install chromium
-dsh --profile browser --dump-config
+dsh plugin --profile web add -w ./dsh-browser-runtime-0.1.2.tgz
+dsh-browser-runtime install chromium
+dsh-browser-runtime doctor
+dsh --profile web --dump-config
 ```
 
 For a GitHub installation, pin a commit:
 
 ```sh
-dsh plugin --profile browser add github:YOUR_ACCOUNT/dsh-browser-runtime#COMMIT_SHA
-dsh plugin --profile browser exec playwright install chromium
+dsh plugin --profile web add -w github:YOUR_ACCOUNT/dsh-browser-runtime#COMMIT_SHA
+dsh-browser-runtime install chromium
 ```
+
+`dsh-browser-runtime doctor` reports the Node version, plugin version, Playwright
+version, whether Chromium exists and where, the export shape each entry point
+presents to the DSH Loader, whether the bundle patch shipped, and whether the
+Provider can open an environment. It exits non-zero when any check fails, so a
+profile setup script can gate on it.
 
 Git installs run the package's `prepare` build. pnpm 10 rejects that script until the profile's `pnpm-workspace.yaml` allows the exact package:
 

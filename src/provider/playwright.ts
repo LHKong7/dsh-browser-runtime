@@ -1,7 +1,6 @@
 /** Isolated Playwright/Chromium provider with bounded observations and storage-state checkpoints. */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
 import { chmod, lstat, mkdtemp, mkdir, readFile, rm, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
@@ -39,6 +38,7 @@ import type {
   BrowserCheckpointRef as BrowserCheckpointRefType,
 } from '../runtime/types.ts'
 import type {} from '../runtime/runtime.ts'
+import { chromiumMissingMessage, readChromiumInstallation } from './chromium.ts'
 import { NetworkPolicy, routeWebSocketWithNetworkPolicy, routeWithNetworkPolicy } from './network-policy.ts'
 import {
   chromiumNetworkArgs,
@@ -176,7 +176,27 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
 
   /** Return true when Playwright's managed Chromium executable exists. */
   available(): boolean {
-    return existsSync(chromium.executablePath())
+    return readChromiumInstallation().installed
+  }
+
+  /** Name the missing Chromium build and the command that installs it. */
+  unavailableReason(): string | undefined {
+    const installation = readChromiumInstallation()
+    return installation.installed ? undefined : chromiumMissingMessage(installation)
+  }
+
+  /**
+   * Summarize the launch configuration for the plugin start log.
+   * @param installation - the Chromium installation state to report.
+   * @returns one `key=value` line per fact, in report order.
+   */
+  startupReport(installation = readChromiumInstallation()): readonly string[] {
+    return [
+      `provider=${this.id}`,
+      `chromium=${installation.installed ? 'available' : 'missing'}`,
+      `headless=${this.config.headless}`,
+      `networkPolicy=${this.config.allowPrivateNetwork ? 'allow-private' : 'strict'}`,
+    ]
   }
 
   /** Open a fresh isolated browser context. */
@@ -1176,9 +1196,15 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error
 }
 
-/** Register the Playwright provider with `ctx.browserRuntime`. */
+/**
+ * Register the Playwright provider with `ctx.browserRuntime` and report the
+ * launch facts an operator needs before the first tool call.
+ */
 export function apply(ctx: Context, config: Config = {}): void {
-  ctx.browserRuntime.registerProvider(new PlaywrightBrowserProvider(config))
+  const provider = new PlaywrightBrowserProvider(config)
+  ctx.browserRuntime.registerProvider(provider)
+  const logger = ctx.logger('browser-runtime')
+  const installation = readChromiumInstallation()
+  for (const line of provider.startupReport(installation)) logger.info(line)
+  if (!installation.installed) logger.warn(chromiumMissingMessage(installation))
 }
-
-export default apply

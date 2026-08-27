@@ -280,6 +280,11 @@ export interface BrowserProvider {
   readonly capabilities: BrowserProviderCapabilities
   /** Report whether this process can open an environment. */
   available(): boolean | Promise<boolean>
+  /**
+   * Explain why `available()` is false and how an operator fixes it.
+   * Selection failures quote this instead of a bare "unavailable".
+   */
+  unavailableReason?(): string | undefined | Promise<string | undefined>
   /** Open a fresh environment; the provider retains cleanup responsibility until fulfillment. */
   open(request: BrowserProviderOpenRequest): Promise<BrowserProviderEnvironment>
   /** Restore an environment; required when checkpoint capability is advertised. */
