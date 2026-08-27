@@ -8,6 +8,7 @@ import { PlaywrightBrowserProvider, apply as applyPlaywright } from 'dsh-browser
 const CAPABILITIES = {
   checkpoint: false,
   screenshot: false,
+  extraction: false,
   multiplePages: false,
   attachExisting: false,
   persistentProfile: false,

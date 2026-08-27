@@ -6,12 +6,15 @@ import {
   BrowserProviderTargetStaleError,
 } from 'dsh-browser-runtime'
 import type {
+  BrowserExtraction,
   BrowserProvider,
   BrowserProviderAction,
   BrowserProviderCapabilities,
   BrowserProviderCheckpoint,
   BrowserProviderEnvironment,
+  BrowserProviderExtractRequest,
   BrowserProviderObservation,
+  BrowserProviderTarget,
   BrowserProviderOpenRequest,
   BrowserProviderRestoreRequest,
   BrowserCheckpointRef as BrowserCheckpointRefType,
@@ -55,6 +58,7 @@ export class FakeBrowserProvider implements BrowserProvider {
     this.capabilities = {
       checkpoint: true,
       screenshot: true,
+      extraction: true,
       multiplePages: false,
       attachExisting: false,
       persistentProfile: false,
@@ -121,6 +125,9 @@ export class FakeEnvironment implements BrowserProviderEnvironment {
   url = 'about:blank'
   title = ''
   text = 'Blank page'
+  /** Reported candidate count; raise it to exercise element truncation. */
+  totalElements = 7
+  elementsTruncated = false
   closes = 0
   checkpoints = 0
   activeActions = 0
@@ -143,11 +150,15 @@ export class FakeEnvironment implements BrowserProviderEnvironment {
       title: this.title,
       text: body,
       truncated: body.length < this.text.length,
+      totalTextChars: this.text.length,
       elements: [
         {
           kind: 'button',
           name: 'Advance',
           disabled: false,
+          section: 'form',
+          priority: 1,
+          pagination: false,
           fingerprint: 'advance',
           target: { key: 'advance' } satisfies FakeTarget,
         },
@@ -156,6 +167,9 @@ export class FakeEnvironment implements BrowserProviderEnvironment {
           name: 'Name',
           disabled: false,
           inputType: 'text',
+          section: 'form',
+          priority: 1,
+          pagination: false,
           fingerprint: 'name',
           target: { key: 'name' } satisfies FakeTarget,
         },
@@ -164,10 +178,61 @@ export class FakeEnvironment implements BrowserProviderEnvironment {
           name: 'Password',
           disabled: false,
           inputType: 'password',
+          section: 'form',
+          priority: 1,
+          pagination: false,
           fingerprint: 'password',
           target: { key: 'password' } satisfies FakeTarget,
         },
+        {
+          kind: 'a',
+          name: '51-100',
+          disabled: false,
+          section: 'navigation',
+          priority: 1,
+          pagination: true,
+          fingerprint: 'page-2',
+          target: { key: 'page-2' } satisfies FakeTarget,
+        },
+        {
+          kind: 'a',
+          name: 'A paper about browsers',
+          disabled: false,
+          section: 'record',
+          priority: 3,
+          pagination: false,
+          groupKey: 'dl[dl]#0',
+          groupLabel: 'A paper about browsers',
+          fingerprint: 'record-0-title',
+          target: { key: 'record-0-title' } satisfies FakeTarget,
+        },
+        {
+          kind: 'a',
+          name: 'Download PDF',
+          disabled: false,
+          section: 'record',
+          priority: 5,
+          pagination: false,
+          groupKey: 'dl[dl]#0',
+          groupLabel: 'A paper about browsers',
+          fingerprint: 'record-0-pdf',
+          target: { key: 'record-0-pdf' } satisfies FakeTarget,
+        },
+        {
+          kind: 'a',
+          name: 'Jane Author',
+          disabled: false,
+          section: 'record',
+          priority: 5,
+          pagination: false,
+          groupKey: 'dl[dl]#1',
+          groupLabel: 'Another paper',
+          fingerprint: 'record-1-author',
+          target: { key: 'record-1-author' } satisfies FakeTarget,
+        },
       ],
+      elementsTruncated: this.elementsTruncated,
+      totalElements: this.totalElements,
     })
   }
 
@@ -185,14 +250,40 @@ export class FakeEnvironment implements BrowserProviderEnvironment {
         this.text = `Page at ${action.url}`
         return
       }
-      if (!isFakeTarget(action.target.target) || action.target.fingerprint !== action.target.target.key) {
+      if (action.type === 'history' || action.type === 'reload') {
+        this.text = `${action.type === 'reload' ? 'Reloaded' : action.direction} ${this.revision}`
+        return
+      }
+      if (action.target !== undefined && !isValidTarget(action.target)) {
         throw new BrowserProviderTargetStaleError()
       }
-      if (action.type === 'click') this.text = `Advanced ${this.revision}`
-      else this.text = `Filled ${action.value.length} characters`
+      switch (action.type) {
+        case 'click': this.text = `Advanced ${this.revision}`; return
+        case 'fill': this.text = `Filled ${action.value.length} characters`; return
+        case 'press': this.text = `Pressed ${action.key}`; return
+        case 'select': this.text = `Selected ${action.values.join(',')}`; return
+        case 'check': this.text = `Checked ${action.checked}`; return
+        case 'scroll': this.text = `Scrolled ${action.to} ${action.pages}`; return
+        case 'wait': this.text = `Waited for ${action.until}`
+      }
     } finally {
       this.activeActions -= 1
     }
+  }
+
+  extract(request: BrowserProviderExtractRequest): Promise<BrowserExtraction> {
+    request.signal.throwIfAborted()
+    if (request.region !== undefined && !isValidTarget(request.region)) {
+      throw new BrowserProviderTargetStaleError()
+    }
+    const columns = ['index', 'title', 'url', 'text']
+    const rows = Array.from({ length: Math.min(request.limit, 3) }, (_row, index) => ({
+      index: String(index),
+      title: `Record ${index}`,
+      url: `${this.url}#${index}`,
+      text: `Body of record ${index}`.slice(0, request.maxTextChars),
+    }))
+    return Promise.resolve({ kind: request.kind, columns, rows, total: 3, truncated: rows.length < 3 })
   }
 
   screenshot({ signal }: { fullPage: boolean; signal: AbortSignal }): Promise<Uint8Array> {
@@ -219,6 +310,11 @@ export class FakeEnvironment implements BrowserProviderEnvironment {
   }
 }
 
-function isFakeTarget(value: unknown): value is FakeTarget {
-  return typeof value === 'object' && value !== null && 'key' in value && typeof value.key === 'string'
+function isValidTarget(target: BrowserProviderTarget): boolean {
+  const value: unknown = target.target
+  return typeof value === 'object'
+    && value !== null
+    && 'key' in value
+    && typeof value.key === 'string'
+    && value.key === target.fingerprint
 }

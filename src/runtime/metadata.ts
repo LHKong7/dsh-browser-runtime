@@ -45,6 +45,17 @@ const transitionSchema = z.object({
   after: observationEvidenceSchema.optional(),
   startedAt: z.string(),
   finishedAt: z.string(),
+  // Optional so a domain written before metrics existed still opens; every row
+  // this version writes carries them.
+  metrics: z.object({
+    durationMs: z.number().int().nonnegative(),
+    actionMs: z.number().int().nonnegative(),
+    observationMs: z.number().int().nonnegative(),
+    textChars: z.number().int().nonnegative(),
+    elementCount: z.number().int().nonnegative(),
+    textTruncated: z.boolean(),
+    elementsTruncated: z.boolean(),
+  }).optional(),
   error: z.object({ name: z.string(), message: z.string(), code: z.string().optional() }).optional(),
 })
 
@@ -71,6 +82,8 @@ export interface BrowserTransitionRecord {
   readonly after?: ObservationEvidence
   readonly startedAt: string
   readonly finishedAt: string
+  /** Absent only on rows written before this package recorded metrics. */
+  readonly metrics?: BrowserTransition['metrics']
   readonly error?: BrowserTransition['error']
 }
 
@@ -101,6 +114,7 @@ export function transitionRecord(transition: BrowserTransition): BrowserTransiti
     ...(transition.after === undefined ? {} : { after: project(transition.after) }),
     startedAt: transition.startedAt,
     finishedAt: transition.finishedAt,
+    metrics: transition.metrics,
     ...(transition.error === undefined ? {} : { error: transition.error }),
   }
 }

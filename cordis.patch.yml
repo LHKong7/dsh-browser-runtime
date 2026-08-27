@@ -22,3 +22,6 @@
         provider: playwright
         persistence: ephemeral
         timeoutMs: 30000
+        observeMode: summary
+        maxTextChars: 12000
+        maxElements: 100
