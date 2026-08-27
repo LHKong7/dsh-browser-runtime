@@ -24,6 +24,14 @@ dsh-browser-runtime doctor
 
 同一个 agent 会获得 `browser_*` 工具和使用说明。一次典型执行会依次完成 `browser_open` → observation 引用 → action 或提取 → 新 observation → 截图，不需要另一个 agent 或单独的编排层。
 
+### 实跑示例：Product Hunt
+
+[Product Hunt 近期产品示例](examples/producthunt-recent-evaluation/run.md)记录了一次对真实网站执行的非 headless DCP 运行。Agent 打开 Product Hunt、获取截图、提取产品链接、评估 24 个当天发布的产品，并在 1 分 13 秒内写出 Markdown 报告，全程没有回退到网页搜索。
+
+[![展示浏览器工具调用的 DCP 运行轨迹](examples/producthunt-recent-evaluation/runtime.png)](examples/producthunt-recent-evaluation/run.md)
+
+示例包含[完整提示词](examples/producthunt-recent-evaluation/prompt.md)、[生成结果](examples/producthunt-recent-evaluation/result.md)、运行截图、配置和复现说明。
+
 ### 其他安装来源
 
 从本地源码安装时，先构建 tarball，再安装该路径：
@@ -189,6 +197,19 @@ Playwright 行：
 Runtime 的 checkpoint 保留由 `checkpointTtlMs`（`0` 表示永久保留）和 `maxCheckpoints` 限制。持久索引加载时会执行一次裁剪；`ctx.browserRuntime.pruneCheckpoints()` 和 `listCheckpoints()` 对外暴露该能力，`dsh-browser-runtime checkpoints [--clear]` 可以列出或删除 Provider 私有 payload。每条记录都保存写入它的 Provider build，恢复时会拒绝由其他 build 写入的 payload。
 
 `persistence: resume` 可以在同一进程内从 Runtime 内存索引恢复。跨进程恢复还需要 DSH 的 `ctx.storageDomain`，Web profile 已经挂载该服务。Checkpoint 元数据写入 `browser_runtime` domain；Playwright 的敏感 storage-state payload 以 owner-only 权限存放在 `$DSH_HOME/browser-runtime/providers/playwright/v1/checkpoints`。
+
+## 合法与可接受使用
+
+`dsh-browser-runtime` 是通用浏览器自动化运行时。请仅将其用于合法目的，并且只访问你拥有或已获授权访问的系统、账号和数据。
+
+- 遵守适用法律、合同义务、网站服务条款和可接受使用政策、API 规则、公开的爬取政策以及速率限制。
+- 不得使用本运行时绕过身份验证、付费墙、访问控制、CAPTCHA 或反滥用机制；不得用于未授权访问、欺诈、网络钓鱼、垃圾信息、骚扰、恶意软件或侵犯知识产权。
+- 收集或处理个人、机密或敏感数据前，应确认具备所需授权、同意或其他合法依据。只收集任务必需的数据，限制访问，采取适当保护，并在不再需要时删除。
+- Observation、截图、attachment、transition 日志、检查点、cookie 和 local storage 都可能包含敏感信息。发布或提交它们之前，应检查其中内容及相关第三方权利。
+- 仅在账号所有者授权下使用凭据，并遵循最小权限原则。审批提示、网络白名单、浏览器隔离等技术控制可以降低风险，但不会自动授予访问权限，也不代表已经满足法律要求。
+- 运行方负责审核自动化输出，并判断其是否可以保存、复用或发布。如果网站规则或授权范围不明确，应停止自动化并取得许可或专业法律意见。
+
+[MIT License](LICENSE) 仅适用于本软件，不适用于第三方网站、服务、内容、账号或数据。本软件按**原样**提供，不保证某种具体用法符合法律要求或会被第三方接受。本节仅提供一般信息，不构成法律意见；涉及具体司法辖区或使用场景时，请咨询具备资质的专业人士。
 
 ## 安全限制
 

@@ -24,6 +24,14 @@ Start or restart the Web profile, then describe a browser task in ordinary langu
 
 The same Agent receives the `browser_*` tools and their usage guidance. A typical run follows `browser_open` → observation refs → actions or extraction → fresh observation → screenshot, without another Agent or separate orchestration layer.
 
+### Live run: Product Hunt
+
+The [Product Hunt recent-products example](examples/producthunt-recent-evaluation/run.md) records a non-headless DCP run against the live site. The Agent opened Product Hunt, captured screenshots, extracted product links, evaluated 24 launches, and wrote a Markdown report in 1 minute 13 seconds without a web-search fallback.
+
+[![DCP trajectory showing the browser tool calls](examples/producthunt-recent-evaluation/runtime.png)](examples/producthunt-recent-evaluation/run.md)
+
+The example includes the [exact prompt](examples/producthunt-recent-evaluation/prompt.md), [generated result](examples/producthunt-recent-evaluation/result.md), runtime screenshot, configuration, and reproduction notes.
+
 ### Other install sources
 
 For a local checkout, build a tarball and install that path:
@@ -189,6 +197,19 @@ Tool row:
 Runtime checkpoint retention is bounded by `checkpointTtlMs` (`0` retains indefinitely) and `maxCheckpoints`. Pruning runs when the durable index loads; `ctx.browserRuntime.pruneCheckpoints()` and `listCheckpoints()` expose it, and `dsh-browser-runtime checkpoints [--clear]` lists or deletes the Provider-private payloads. A record keeps the Provider build that wrote it, and a restore refuses a payload from a different build.
 
 With `persistence: resume`, checkpoints restore inside the same process from the runtime's in-memory index. Cross-process restore additionally requires DSH's `ctx.storageDomain`; the Web profile already mounts it. Checkpoint metadata goes to the `browser_runtime` domain, while Playwright stores the sensitive storage-state payload under `$DSH_HOME/browser-runtime/providers/playwright/v1/checkpoints` with owner-only permissions.
+
+## Legal and acceptable use
+
+`dsh-browser-runtime` is a general-purpose browser automation runtime. Use it only for lawful purposes and only with systems, accounts, and data that you own or are authorized to access.
+
+- Follow applicable laws, contractual obligations, website terms of service and acceptable-use policies, API rules, published crawling policies, and rate limits.
+- Do not use the runtime to bypass authentication, paywalls, access controls, CAPTCHAs, or anti-abuse systems; gain unauthorized access; or facilitate fraud, phishing, spam, harassment, malware, or intellectual-property infringement.
+- Before collecting or processing personal, confidential, or sensitive data, establish the required authorization, consent, or other lawful basis. Collect only what the task needs, restrict access, protect it appropriately, and delete it when it is no longer needed.
+- Treat observations, screenshots, attachments, transition logs, checkpoints, cookies, and local storage as potentially sensitive. Do not publish or commit them without reviewing their contents and third-party rights.
+- Use credentials only with the account owner's authorization and least-privilege access. Approval prompts, network allowlists, browser isolation, and other technical controls reduce risk but do not grant permission or establish legal compliance.
+- The operator is responsible for reviewing automated output and deciding whether it may be stored, reused, or published. If a site's rules or authorization are unclear, stop the automation and obtain permission or legal guidance.
+
+The [MIT License](LICENSE) applies to this software, not to third-party websites, services, content, accounts, or data. The software is provided **as is**, without a warranty that a particular use is lawful or accepted by a third party. This section is general information, not legal advice; consult qualified counsel for requirements that apply to your jurisdiction and use case.
 
 ## Security limits
 
