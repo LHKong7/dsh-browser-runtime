@@ -2,38 +2,82 @@
 
 English | [中文](README.zh.md)
 
-`dsh-browser-runtime` gives each DeepSeek Harness Agent a leased, stateful browser environment. It owns provider selection, Agent isolation, lifecycle, serialized operations, stale-reference checks, checkpoint indexing, and transition evidence. Playwright is one provider behind that API, and the model tools are a separate consumer.
+> Turn any DeepSeek Harness Agent into an isolated, stateful browser Agent.
 
-This repository is one installable DSH bundle with three plugin entry points:
+`dsh-browser-runtime` gives the Agent a real Chromium browser for interactive pages: it can navigate, observe, click, fill forms, wait for updates, extract structured content, and save screenshots. One DSH bundle installs the runtime, the Playwright Provider, the model tools, and the system prompt guidance that teaches the existing Agent how to use them.
 
-| Entry point | Role | Service or tools |
+This is a browser runtime rather than a loose collection of Playwright calls. It owns Agent isolation, browser lifecycle, serialized operations, stale-reference checks, resumable checkpoints, transition evidence, credential handling, and outbound network policy. It extends the current DSH Agent instead of starting a second browser-specific agent loop.
+
+## Quick start
+
+Prerequisites are DeepSeek Harness, Node.js `^22.19` or `>=24`, and pnpm 10. Install the bundle, install its pinned Chromium build, and verify the runtime:
+
+```sh
+dsh plugin --profile web add -w dsh-browser-runtime
+dsh-browser-runtime install chromium
+dsh-browser-runtime doctor
+```
+
+Start or restart the Web profile, then describe a browser task in ordinary language:
+
+> Open Hacker News, extract the first ten stories, open the most popular one and summarize it, then save a full-page screenshot.
+
+The same Agent receives the `browser_*` tools and their usage guidance. A typical run follows `browser_open` → observation refs → actions or extraction → fresh observation → screenshot, without another Agent or separate orchestration layer.
+
+### Other install sources
+
+For a local checkout, build a tarball and install that path:
+
+```sh
+pnpm install
+pnpm pack
+dsh plugin --profile web add -w ./dsh-browser-runtime-0.1.2.tgz
+dsh-browser-runtime install chromium
+dsh-browser-runtime doctor
+dsh --profile web --dump-config
+```
+
+For a GitHub installation, pin a reviewed commit:
+
+```sh
+dsh plugin --profile web add -w github:YOUR_ACCOUNT/dsh-browser-runtime#COMMIT_SHA
+dsh-browser-runtime install chromium
+```
+
+`dsh-browser-runtime doctor` reports the Node, plugin, and Playwright versions; the Chromium installation and path; the exports seen by the DSH Loader; the bundle patch; and whether the Provider can open an environment. It exits non-zero when a check fails.
+
+Git installs run the package's `prepare` build. pnpm 10 rejects that script until the profile's `pnpm-workspace.yaml` allows the exact package:
+
+```yaml
+allowBuilds:
+  dsh-browser-runtime: true
+```
+
+Review and pin the source before granting build permission. A published npm package or the tarball path ships built artifacts and does not need that permission.
+
+## What the Agent gains
+
+- Eighteen always-available browser tools cover navigation, observation, forms, scrolling, waiting, screenshots, and structured extraction; an optional credential tool fills stored secrets without exposing plaintext to the model.
+- Each exact Agent object owns an isolated BrowserContext and Page, so parallel Agents do not share cookies, navigation state, element refs, or browser cleanup.
+- Ranked observations put controls, pagination, navigation, and record titles ahead of repeated low-value links, and continuation reads more without reminting refs.
+- Actions accept refs from the latest observation instead of model-supplied selectors or JavaScript; stale or mutated targets fail before the Provider acts.
+- `resume` checkpoints preserve cookies and localStorage across browser generations, while ephemeral mode starts clean.
+- Every admitted action records before/after evidence, timing, outcome, and a machine-routable recovery line when it fails.
+
+## Why use a browser runtime?
+
+| Concern | Browser calls wired directly into an Agent | `dsh-browser-runtime` |
 |---|---|---|
-| `dsh-browser-runtime` | Service Definition and control plane | `ctx.browserRuntime` |
-| `dsh-browser-runtime/playwright` | Playwright/Chromium Provider | provider id `playwright` |
-| `dsh-browser-runtime/tools` | Model-facing Consumer | the `browser_*` tools |
+| Installation | Integrate a tool server, prompt, browser process, and cleanup path | One DSH bundle mounts the runtime, Provider, tools, and guidance |
+| Multiple Agents | The integration must partition browser state and cancellation | One isolated environment per exact Agent, with independent leases and FIFOs |
+| Element addressing | Selectors, page JavaScript, or refs with caller-managed validity | Latest-observation refs with runtime and Provider stale checks |
+| State | A shared profile or integration-specific storage state | Explicit `ephemeral` or resumable checkpoint policy per Agent session |
+| Failures | Tool exceptions without a shared recovery contract | Transition evidence plus code, state validity, recommended action, and retryability |
+| Security | Deployment-specific browser and secret controls | Strict public-network default, bounded output, and an approval-aware credential channel |
 
-The single-package layout supports `dsh plugin add github:...`. The source directories preserve the three roles so they can become separate npm packages if their release cycles diverge.
+The Provider registry is replaceable: Playwright/Chromium is the bundled Provider, while consumers depend on `BrowserRuntime` rather than Playwright objects, CSS selectors, or host paths. This keeps the Agent-facing behavior stable when another Provider is added.
 
-The two functional plugin entry points use named exports only. The DSH Loader resolves an imported module with `exports.default ?? exports`, so a default export would discard `inject`, `Config`, and `name` and the Provider would fail at `ctx.browserRuntime`. A default export is reserved for a Service or class plugin that carries `inject` and `Config` as static properties, which is why the runtime entry keeps `export { BrowserRuntime as default }`. `pnpm run verify:tarball` enforces this against the packed archive.
-
-## v0.1 behavior
-
-- One isolated BrowserContext and one Page per exact Agent object.
-- Concurrent acquisition by the same owner shares setup and returns independent leases; different owners never share an environment.
-- Cancelling one acquire or tool call stops only that caller's wait; another waiter can finish the shared owner setup.
-- Cancelling an active browser operation releases the possibly unusable Agent lease; the next tool call opens or restores a fresh environment.
-- Operations for one environment run FIFO; separate environments may run concurrently.
-- Each observation mints local refs such as `e1`. Only refs from the latest observation are accepted.
-- Observations are ranked into five tiers — form controls and pagination, site navigation, record titles, body links, then repeated per-record links — so a budget cut drops author links before it drops a paging link. Repeating page records collapse into groups such as `g1`, and a `dt`/`dd` pair counts as one record.
-- `browser_observe` takes a `mode` (`summary`, `interactive`, `document`) plus `max_text_chars` and `max_elements`. `browser_observe_next` reads the rest of the newest observation without re-observing, so element refs stay valid while paging.
-- Every action produces before/after transition evidence with timing and output-size metrics. Fill values are redacted from runtime evidence.
-- Tool failures append one machine-routable line: `code`, `url`, `observation`, `lease`, `recommended_action`, `retryable`. Nothing is retried automatically, because a click that failed may still have navigated.
-- A compact transition-index write failure warns the operator without changing action success, Provider failure, or cancellation; current-process queries retain the bounded in-memory record.
-- Screenshots are PNG attachments through `ctx.attachments`; the model cannot choose a host path.
-- `resume` checkpoints cookies and localStorage. A restore creates a new generation, invalidating every prior page, observation, and element identity. Checkpoint payload creation, index commit or rollback, and old-payload cleanup serialize per session across owner objects; one Provider cannot replace another Provider's session checkpoint.
-- Provider unload aborts and waits selection/opening before provider-wide disposal; last-lease release, Agent disposal, and runtime unload also await browser cleanup.
-
-The model tools are:
+## Model tools
 
 | Tool | Purpose |
 |---|---|
@@ -52,96 +96,44 @@ The model tools are:
 | `browser_screenshot` | Save a viewport or full-page PNG attachment |
 | `browser_extract_list` / `_table` / `_links` / `_article` | Read structured content from a region |
 
-`browser_fill_credential` is registered only where a credential source is configured. Extraction tools take a `region_ref` from the latest observation, never a selector and never JavaScript; an element reference widens to the region a caller means by it, so naming one record's link extracts the whole listing. The browser suits interactive pages: for hundreds or thousands of static records, an official API or a direct fetch beats paging through it, and the system prompt says so.
+`browser_fill_credential` is registered only where a credential source is configured. Extraction tools take a `region_ref` from the latest observation, never a selector or JavaScript; an element ref widens to the semantic region the caller means, so naming one record's link can extract the surrounding list. For hundreds or thousands of static records, prefer an official API or direct fetch over browser paging.
 
-## Develop and test
+## Architecture at a glance
 
-Prerequisites are Node.js `^22.19` or `>=24` and pnpm 10.
-
-```sh
-pnpm install
-node lib/cli/index.js install chromium
-pnpm run typecheck
-pnpm run test:coverage
-pnpm run build
-pnpm run lint:package
-pnpm run verify:package
-pnpm run verify:tarball
+```text
+DSH Agent -> browser_* tools -> BrowserRuntime -> Playwright Provider -> Chromium
 ```
 
-`pnpm test` uses a real local HTTP server and Chromium when Playwright's managed browser is present. The Playwright suite self-skips when Chromium is absent; CI installs it explicitly.
+The installable package contains three plugin entry points:
 
-### Scenario coverage
+| Entry point | Role | Service or tools |
+|---|---|---|
+| `dsh-browser-runtime` | Service Definition and control plane | `ctx.browserRuntime` |
+| `dsh-browser-runtime/playwright` | Playwright/Chromium Provider | Provider id `playwright` |
+| `dsh-browser-runtime/tools` | Model-facing Consumer | the `browser_*` tools and prompt guidance |
 
-| Scenario | Covered by |
-|---|---|
-| Open a public static page | `playwright.integration.spec.ts` |
-| Fill a search box and press Enter | `playwright-observation.integration.spec.ts` |
-| Act on the observation an action returned | `browser-tools.spec.ts`, `tool.integration.spec.ts` |
-| Act on a superseded reference and get a stale error | `browser-tools.spec.ts`, `playwright-observation.integration.spec.ts` |
-| Asynchronous page update after a click | `playwright-observation.integration.spec.ts` |
-| Select, checkbox, and scroll | `playwright-observation.integration.spec.ts` |
-| Full-page screenshot | `playwright.integration.spec.ts` |
-| Private network denied by default, admitted by allowlist | `network-policy.spec.ts`; the real-browser suites run under `mode: allowlist` |
-| Cookie and localStorage checkpoint restore | `playwright.integration.spec.ts`, `storage.integration.spec.ts` |
-| Lease rebuilt after a cancelled operation | `tool.integration.spec.ts` |
-| Two Agents isolated in parallel | `browser-tools.spec.ts`, `runtime.spec.ts` |
-| Provider unload and resource reclamation | `runtime.spec.ts` |
-| Missing-Chromium diagnosis | `startup-diagnostics.spec.ts`, `cli-main.spec.ts` |
-| The final tarball mounts and registers its tools | `verify:tarball` |
+The bundle patch mounts all three roles together. The source directories keep the roles separate so a new Provider can register behind the same Runtime and tool Consumer. See [architecture and provider API](docs/architecture.md) for ownership, cancellation, persistence, evidence, and extension rules.
 
-`verify:tarball` mounts the packed archive in a real Cordis Context with the real DSH tool, system-prompt, and attachment services, and runs `doctor` against the extracted files. It is not a `dsh` profile install: nothing here drives the `dsh` CLI, so the last mile — `dsh plugin --profile web add -w …` followed by a real profile start — still needs a manual check on a machine that has DSH.
+## Runtime behavior
 
-`verify:package` runs the artifact conformance gate over the built tree, and `verify:tarball` packs, extracts, and re-runs it over the exact archive a profile installs: every `exports` subpath resolves, the functional plugin entries carry no default export, the real `Loader.unwrapExports` keeps their `inject`/`Config`/`name`, all three entries mount in a real Cordis Context, `doctor` runs against the extracted files, and the report prints the package version, source commit, and an integrity digest of the entry points.
-
-## Install into DeepSeek Harness
-
-A DSH profile is a pnpm workspace root, so `add` needs `-w`. The plugin ships its
-own browser installer and a diagnostic command, so no step depends on where pnpm
-happens to place the transitive `playwright` dependency:
-
-```sh
-dsh plugin --profile web add -w dsh-browser-runtime
-dsh-browser-runtime install chromium
-dsh-browser-runtime doctor
-```
-
-For a local checkout, build a tarball and install that path instead:
-
-```sh
-pnpm install
-pnpm pack
-dsh plugin --profile web add -w ./dsh-browser-runtime-0.1.2.tgz
-dsh-browser-runtime install chromium
-dsh-browser-runtime doctor
-dsh --profile web --dump-config
-```
-
-For a GitHub installation, pin a commit:
-
-```sh
-dsh plugin --profile web add -w github:YOUR_ACCOUNT/dsh-browser-runtime#COMMIT_SHA
-dsh-browser-runtime install chromium
-```
-
-`dsh-browser-runtime doctor` reports the Node version, plugin version, Playwright
-version, whether Chromium exists and where, the export shape each entry point
-presents to the DSH Loader, whether the bundle patch shipped, and whether the
-Provider can open an environment. It exits non-zero when any check fails, so a
-profile setup script can gate on it.
-
-Git installs run the package's `prepare` build. pnpm 10 rejects that script until the profile's `pnpm-workspace.yaml` allows the exact package:
-
-```yaml
-allowBuilds:
-  dsh-browser-runtime: true
-```
-
-Review and pin the source before granting build permission. A published npm package or the tarball path ships built artifacts and does not need that permission.
+- One isolated BrowserContext and one Page per exact Agent object.
+- Concurrent acquisition by the same owner shares setup and returns independent leases; different owners never share an environment.
+- Cancelling one acquire or tool call stops only that caller's wait; another waiter can finish the shared owner setup.
+- Cancelling an active browser operation releases the possibly unusable Agent lease; the next tool call opens or restores a fresh environment.
+- Operations for one environment run FIFO; separate environments may run concurrently.
+- Each observation mints local refs such as `e1`. Only refs from the latest observation are accepted.
+- Observations are ranked into five tiers — form controls and pagination, site navigation, record titles, body links, then repeated per-record links — so a budget cut drops author links before it drops a paging link. Repeating page records collapse into groups such as `g1`, and a `dt`/`dd` pair counts as one record.
+- `browser_observe` takes a `mode` (`summary`, `interactive`, `document`) plus `max_text_chars` and `max_elements`. `browser_observe_next` reads the rest of the newest observation without re-observing, so element refs stay valid while paging.
+- Every action produces before/after transition evidence with timing and output-size metrics. Fill values are redacted from runtime evidence.
+- Tool failures append one machine-routable line: `code`, `url`, `observation`, `lease`, `recommended_action`, `retryable`. Nothing is retried automatically, because a click that failed may still have navigated.
+- A compact transition-index write failure warns the operator without changing action success, Provider failure, or cancellation; current-process queries retain the bounded in-memory record.
+- Screenshots are PNG attachments through `ctx.attachments`; the model cannot choose a host path.
+- `resume` checkpoints cookies and localStorage. A restore creates a new generation, invalidating every prior page, observation, and element identity. Checkpoint payload creation, index commit or rollback, and old-payload cleanup serialize per session across owner objects; one Provider cannot replace another Provider's session checkpoint.
+- Provider unload aborts and waits selection/opening before provider-wide disposal; last-lease release, Agent disposal, and runtime unload also await browser cleanup.
 
 ## Configuration
 
-The bundle's [`cordis.patch.yml`](cordis.patch.yml) selects Playwright, uses ephemeral Agent environments, blocks private networks, and registers all five tools. A user profile can replace any row by id; DSH patches replace the complete `config`, so restate every field for that row.
+The bundle's [`cordis.patch.yml`](cordis.patch.yml) selects Playwright, uses ephemeral Agent environments, blocks private networks, and registers the complete browser tool suite. A user profile can replace any row by id; DSH patches replace the complete `config`, so restate every field for that row.
 
 Runtime row:
 
@@ -152,6 +144,8 @@ Runtime row:
     maxTextChars: 60000
     maxTransitionsInMemory: 500
     cleanupTimeoutMs: 10000
+    checkpointTtlMs: 0
+    maxCheckpoints: 100
 ```
 
 Playwright row:
@@ -238,4 +232,44 @@ The proxy and browser launch controls are application-level egress restrictions,
 
 v0.1 has no popup handoff, downloads, uploads, arbitrary JavaScript, real-Chrome attachment, cross-provider checkpoint conversion, IndexedDB/sessionStorage restore, or generic non-browser Environment API. Checkpoint payloads are owner-only files on disk rather than encrypted or key-managed storage. There is no dedicated browser Web UI and no CDP Provider for attaching to a running Chrome. Playwright-managed Chromium must be installed separately.
 
-See [architecture and provider API](docs/architecture.md) for ownership, failure, evidence, and extension rules.
+## Develop and test
+
+```sh
+pnpm install
+node lib/cli/index.js install chromium
+pnpm run typecheck
+pnpm run test:coverage
+pnpm run build
+pnpm run lint:package
+pnpm run verify:package
+pnpm run verify:tarball
+```
+
+`pnpm test` uses a real local HTTP server and Chromium when Playwright's managed browser is present. The Playwright suite self-skips when Chromium is absent; CI installs it explicitly.
+
+### Scenario coverage
+
+| Scenario | Covered by |
+|---|---|
+| Open a public static page | `playwright.integration.spec.ts` |
+| Fill a search box and press Enter | `playwright-observation.integration.spec.ts` |
+| Act on the observation an action returned | `browser-tools.spec.ts`, `tool.integration.spec.ts` |
+| Act on a superseded reference and get a stale error | `browser-tools.spec.ts`, `playwright-observation.integration.spec.ts` |
+| Asynchronous page update after a click | `playwright-observation.integration.spec.ts` |
+| Select, checkbox, and scroll | `playwright-observation.integration.spec.ts` |
+| Full-page screenshot | `playwright.integration.spec.ts` |
+| Private network denied by default, admitted by allowlist | `network-policy.spec.ts`; the real-browser suites run under `mode: allowlist` |
+| Cookie and localStorage checkpoint restore | `playwright.integration.spec.ts`, `storage.integration.spec.ts` |
+| Lease rebuilt after a cancelled operation | `tool.integration.spec.ts` |
+| Two Agents isolated in parallel | `browser-tools.spec.ts`, `runtime.spec.ts` |
+| Provider unload and resource reclamation | `runtime.spec.ts` |
+| Missing-Chromium diagnosis | `startup-diagnostics.spec.ts`, `cli-main.spec.ts` |
+| The final tarball mounts and registers its tools | `verify:tarball` |
+
+`verify:tarball` mounts the packed archive in a real Cordis Context with the real DSH tool, system-prompt, and attachment services, and runs `doctor` against the extracted files. It is not a `dsh` profile install: nothing here drives the `dsh` CLI, so the last mile — `dsh plugin --profile web add -w …` followed by a real profile start — still needs a manual check on a machine that has DSH.
+
+`verify:package` runs the artifact conformance gate over the built tree, and `verify:tarball` packs, extracts, and re-runs it over the exact archive a profile installs: every `exports` subpath resolves, the functional plugin entries carry no default export, the real `Loader.unwrapExports` keeps their `inject`/`Config`/`name`, all three entries mount in a real Cordis Context, `doctor` runs against the extracted files, and the report prints the package version, source commit, and an integrity digest of the entry points.
+
+### Packaging contract
+
+The two functional plugin entry points use named exports only. The DSH Loader resolves an imported module with `exports.default ?? exports`, so a default export would discard `inject`, `Config`, and `name` and the Provider would fail at `ctx.browserRuntime`. A default export is reserved for a Service or class plugin that carries `inject` and `Config` as static properties, which is why the Runtime entry keeps `export { BrowserRuntime as default }`. `pnpm run verify:tarball` enforces this against the packed archive.

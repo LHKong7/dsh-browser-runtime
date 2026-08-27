@@ -2,38 +2,82 @@
 
 [English](README.md) | 中文
 
-`dsh-browser-runtime` 为每个 DeepSeek Harness Agent 提供有租约、有状态的浏览器环境。它负责 Provider 选择、Agent 隔离、生命周期、操作串行化、过期引用检查、checkpoint 索引和 transition 证据；Playwright 只是该 API 后面的一个 Provider，模型工具则是独立 Consumer。
+> 让任何 DeepSeek Harness agent（智能体）成为具有隔离环境和持久状态的 browser agent（浏览器智能体）。
 
-仓库是一个可安装的 DSH bundle，包含三个插件入口：
+`dsh-browser-runtime` 为 agent 提供可操作交互式页面的真实 Chromium 浏览器：它可以导航、观察、点击、填写表单、等待更新、提取结构化内容并保存截图。一个 DSH bundle 会同时安装运行时、Playwright 提供方、模型工具，以及教现有 agent 使用这些能力的系统提示词。
 
-| 入口 | 角色 | Service 或工具 |
+这是一套浏览器运行时，而不是一组松散的 Playwright 调用。它负责 agent 隔离、浏览器生命周期、操作串行化、陈旧引用检查、可恢复检查点、transition 证据、凭据处理和出站网络策略。它直接扩展当前 DSH agent，不会启动第二套浏览器专用 agent loop（智能体循环）。
+
+## 快速开始
+
+需要 DeepSeek Harness、Node.js `^22.19` 或 `>=24`，以及 pnpm 10。安装 bundle、安装它固定版本的 Chromium build，然后验证运行时：
+
+```sh
+dsh plugin --profile web add -w dsh-browser-runtime
+dsh-browser-runtime install chromium
+dsh-browser-runtime doctor
+```
+
+启动或重启 Web profile，然后用自然语言描述浏览器任务：
+
+> 打开 Hacker News，提取前十条内容，进入最热门的一条并总结，最后保存一张完整页面截图。
+
+同一个 agent 会获得 `browser_*` 工具和使用说明。一次典型执行会依次完成 `browser_open` → observation 引用 → action 或提取 → 新 observation → 截图，不需要另一个 agent 或单独的编排层。
+
+### 其他安装来源
+
+从本地源码安装时，先构建 tarball，再安装该路径：
+
+```sh
+pnpm install
+pnpm pack
+dsh plugin --profile web add -w ./dsh-browser-runtime-0.1.2.tgz
+dsh-browser-runtime install chromium
+dsh-browser-runtime doctor
+dsh --profile web --dump-config
+```
+
+从 GitHub 安装时，应固定经过审查的 commit：
+
+```sh
+dsh plugin --profile web add -w github:YOUR_ACCOUNT/dsh-browser-runtime#COMMIT_SHA
+dsh-browser-runtime install chromium
+```
+
+`dsh-browser-runtime doctor` 会报告 Node、插件和 Playwright 版本，Chromium 的安装状态和路径，DSH Loader 看到的导出，bundle patch，以及提供方能否打开环境。任何检查失败都会以非零码退出。
+
+Git 安装会执行本包的 `prepare` 构建。pnpm 10 会拒绝该脚本，直到 profile 的 `pnpm-workspace.yaml` 允许精确包名：
+
+```yaml
+allowBuilds:
+  dsh-browser-runtime: true
+```
+
+授权构建前应审查并固定源码。发布到 npm 的包或 tarball 已携带构建产物，不需要该授权。
+
+## Agent 获得什么
+
+- 十八个始终可用的浏览器工具覆盖导航、观察、表单、滚动、等待、截图和结构化提取；可选凭据工具可以填写已存秘密，而不会向模型暴露明文。
+- 每个精确 Agent 对象拥有隔离的 BrowserContext 和 Page，因此并行 Agent 不会共享 cookie、导航状态、元素引用或浏览器清理过程。
+- 排序后的 observation 会把控件、分页、导航和记录标题放在重复的低价值链接之前，continuation 可以继续读取而不重新生成引用。
+- Action 只接受最新 observation 的引用，不接受模型提供的 selector 或 JavaScript；陈旧或已变化的目标会在提供方执行前失败。
+- `resume` 检查点可以跨浏览器 generation 保留 cookie 和 localStorage，ephemeral 模式则每次从干净环境开始。
+- 每个被接受的 action 都会记录 before/after 证据、耗时与结果；失败时还会返回一行可由机器路由的恢复信息。
+
+## 为什么要使用浏览器运行时？
+
+| 关注点 | 直接为 Agent 接入浏览器调用 | `dsh-browser-runtime` |
 |---|---|---|
-| `dsh-browser-runtime` | Service Definition 与控制面 | `ctx.browserRuntime` |
-| `dsh-browser-runtime/playwright` | Playwright/Chromium Provider | Provider id `playwright` |
-| `dsh-browser-runtime/tools` | 面向模型的 Consumer | 一组 `browser_*` 工具 |
+| 安装 | 分别接入工具服务器、提示词、浏览器进程和清理路径 | 一个 DSH bundle 挂载运行时、提供方、工具和使用说明 |
+| 多 Agent | 集成方负责分隔浏览器状态和取消操作 | 每个精确 Agent 拥有隔离环境、独立 lease 和 FIFO |
+| 元素寻址 | selector、页面 JavaScript，或由调用方维护有效性的引用 | 最新 observation 引用，并由运行时和提供方执行陈旧检查 |
+| 状态 | 共享 profile 或集成特有的 storage state | 每个 Agent session 显式选择 `ephemeral` 或可恢复检查点策略 |
+| 失败 | 工具异常没有统一恢复约定 | transition 证据，以及错误码、状态有效性、建议 action 和可重试性 |
+| 安全 | 由部署自行实现浏览器和秘密控制 | 默认仅允许公网、限制输出，并提供支持审批的凭据通道 |
 
-单包结构支持 `dsh plugin add github:...`。源码仍按三个角色分目录；如果它们以后需要独立发布节奏，可以直接拆成不同 npm 包。
+提供方注册表可替换：Playwright/Chromium 是随包提供的实现，消费方依赖 `BrowserRuntime`，不依赖 Playwright 对象、CSS selector 或宿主机路径。因此增加其他提供方时，面向 Agent 的行为可以保持稳定。
 
-两个函数式插件入口只使用具名导出。DSH Loader 用 `exports.default ?? exports` 解析导入的模块，因此 default 导出会丢弃 `inject`、`Config` 和 `name`，Provider 会在 `ctx.browserRuntime` 处失败。default 导出只保留给把 `inject` 和 `Config` 作为静态属性携带的 Service 或 class 插件，所以 runtime 入口保留 `export { BrowserRuntime as default }`。`pnpm run verify:tarball` 会针对打包后的归档执行这条规则。
-
-## v0.1 行为
-
-- 每个精确 Agent 对象拥有一个隔离 BrowserContext 和一个 Page。
-- 同一 owner 的并发 acquire 共享初始化并返回独立 lease；不同 owner 永不共享环境。
-- 取消一个 acquire 或工具调用只终止该调用方的等待；其他等待方仍可完成 owner 共享初始化。
-- 取消正在执行的浏览器操作会释放可能已不可用的 Agent lease；下一次工具调用会打开或恢复新环境。
-- 同一环境的操作按 FIFO 执行；不同环境可以并行。
-- 每次 observation 生成 `e1` 之类的局部引用；只有最新 observation 的引用可以执行。
-- observation 按五个层级排序——表单控件与分页、站点导航、记录标题、正文链接、重复的记录内链接——因此预算裁剪会先丢弃作者链接，而不是分页链接。重复的页面记录会折叠成 `g1` 这样的分组，`dt`/`dd` 一对算作同一条记录。
-- `browser_observe` 接受 `mode`（`summary`、`interactive`、`document`）以及 `max_text_chars` 和 `max_elements`。`browser_observe_next` 在不重新观察的前提下继续读取最新 observation，因此翻页期间元素引用保持有效。
-- 每个 action 都生成带耗时与输出规模指标的 before/after transition 证据；fill 内容不会写入 Runtime 证据。
-- 工具失败会追加一行可路由信息：`code`、`url`、`observation`、`lease`、`recommended_action`、`retryable`。系统不会自动重试，因为失败的点击仍可能已经发生跳转。
-- 紧凑 transition 索引写入失败会记录一条运维警告，但不会改变 action 成功、Provider 失败或取消的结果；当前进程的查询会保留有界内存记录。
-- 截图通过 `ctx.attachments` 保存为 PNG，模型不能指定宿主机路径。
-- `resume` 保存 cookie 和 localStorage；恢复后 generation 增加，旧 page、observation、element 身份全部失效。同一 session 的 checkpoint payload 创建、索引提交或回滚以及旧 payload 清理会跨 owner 串行执行；一个 Provider 不能替换另一个 Provider 的 session checkpoint。
-- Provider 卸载会在 Provider 级资源释放前中止并等待选择与初始化；最后一个 lease 释放、Agent 销毁和 Runtime 卸载也会等待浏览器资源清理完成。
-
-模型工具：
+## 模型工具
 
 | 工具 | 用途 |
 |---|---|
@@ -52,93 +96,44 @@
 | `browser_screenshot` | 保存视口或整页 PNG attachment |
 | `browser_extract_list` / `_table` / `_links` / `_article` | 从某个区域读取结构化内容 |
 
-只有在配置了凭据来源时才会注册 `browser_fill_credential`。提取工具接受最新 observation 中的 `region_ref`，既不接受 selector 也不接受 JavaScript；元素引用会扩展到调用方真正指的那个区域，因此指定某条记录的链接就能提取整个列表。浏览器适合交互式页面：面对数百或数千条静态数据时，官方 API 或直接 fetch 优于逐页点击，系统提示中也这样说明。
+只有在配置了凭据来源时才会注册 `browser_fill_credential`。提取工具接受最新 observation 中的 `region_ref`，既不接受 selector 也不接受 JavaScript；元素引用会扩展到调用方所指的语义区域，因此指定某条记录的链接可以提取它所在的列表。面对数百或数千条静态数据时，官方 API 或直接 fetch 优于浏览器逐页操作。
 
-## 开发与测试
+## 架构概览
 
-需要 Node.js `^22.19` 或 `>=24`，以及 pnpm 10。
-
-```sh
-pnpm install
-node lib/cli/index.js install chromium
-pnpm run typecheck
-pnpm run test:coverage
-pnpm run build
-pnpm run lint:package
-pnpm run verify:package
-pnpm run verify:tarball
+```text
+DSH Agent -> browser_* tools -> BrowserRuntime -> Playwright Provider -> Chromium
 ```
 
-如果 Playwright 管理的 Chromium 存在，`pnpm test` 会启动真实本地 HTTP server 和 Chromium；没有 Chromium 时 Playwright 测试会自行跳过，CI 会明确安装 Chromium。
+可安装包包含三个插件入口：
 
-### 场景覆盖
+| 入口 | 角色 | Service 或工具 |
+|---|---|---|
+| `dsh-browser-runtime` | Service Definition 与控制面 | `ctx.browserRuntime` |
+| `dsh-browser-runtime/playwright` | Playwright/Chromium Provider | Provider id `playwright` |
+| `dsh-browser-runtime/tools` | 面向模型的 Consumer | `browser_*` 工具和提示词说明 |
 
-| 场景 | 覆盖它的测试 |
-|---|---|
-| 打开公开静态网页 | `playwright.integration.spec.ts` |
-| 填写搜索框并按 Enter | `playwright-observation.integration.spec.ts` |
-| 使用 action 返回的新 observation | `browser-tools.spec.ts`、`tool.integration.spec.ts` |
-| 用已被替换的引用操作并得到 stale 错误 | `browser-tools.spec.ts`、`playwright-observation.integration.spec.ts` |
-| 点击后页面异步更新 | `playwright-observation.integration.spec.ts` |
-| 下拉框、复选框和滚动 | `playwright-observation.integration.spec.ts` |
-| 完整页面截图 | `playwright.integration.spec.ts` |
-| 私网默认拒绝、白名单允许 | `network-policy.spec.ts`；真实浏览器套件都在 `mode: allowlist` 下运行 |
-| Cookie/localStorage checkpoint 恢复 | `playwright.integration.spec.ts`、`storage.integration.spec.ts` |
-| 操作取消后 lease 重建 | `tool.integration.spec.ts` |
-| 两个 Agent 并行隔离 | `browser-tools.spec.ts`、`runtime.spec.ts` |
-| Provider 卸载与资源回收 | `runtime.spec.ts` |
-| Chromium 缺失诊断 | `startup-diagnostics.spec.ts`、`cli-main.spec.ts` |
-| 最终 tarball 能挂载并注册工具 | `verify:tarball` |
+Bundle patch 会同时挂载三个角色。源码目录仍将角色分开，因此新的提供方可以注册到相同运行时和工具消费方后面。所有权、取消、持久化、证据与扩展规则见[架构及提供方 API](docs/architecture.zh.md)。
 
-`verify:tarball` 会把打包后的归档挂载到真实 Cordis Context 中，使用真实的 DSH tools、system-prompt 与 attachment 服务，并对解压后的文件运行 `doctor`。它不是一次 `dsh` profile 安装：这里没有任何环节驱动 `dsh` CLI，因此最后一步——`dsh plugin --profile web add -w …` 之后真实启动 profile——仍需在装有 DSH 的机器上手动验证。
+## 运行时行为
 
-`verify:package` 针对构建产物运行发布物门禁，`verify:tarball` 则先打包、解压，再针对 profile 实际安装的那份归档重跑一遍：每个 `exports` 子路径都能解析、函数式插件入口没有 default 导出、真实的 `Loader.unwrapExports` 保留了它们的 `inject`/`Config`/`name`、三个入口都能在真实 Cordis Context 中挂载、`doctor` 针对解压后的文件运行，并输出包版本、源码提交和入口的完整性摘要。
-
-## 安装到 DeepSeek Harness
-
-DSH profile 是 pnpm workspace 根，因此 `add` 需要 `-w`。插件自带浏览器安装程序和诊断命令，
-所以任何一步都不依赖 pnpm 把传递依赖 `playwright` 放在哪个目录：
-
-```sh
-dsh plugin --profile web add -w dsh-browser-runtime
-dsh-browser-runtime install chromium
-dsh-browser-runtime doctor
-```
-
-本地源码改为先打 tarball，再安装该路径：
-
-```sh
-pnpm install
-pnpm pack
-dsh plugin --profile web add -w ./dsh-browser-runtime-0.1.2.tgz
-dsh-browser-runtime install chromium
-dsh-browser-runtime doctor
-dsh --profile web --dump-config
-```
-
-从 GitHub 安装时应固定 commit：
-
-```sh
-dsh plugin --profile web add -w github:YOUR_ACCOUNT/dsh-browser-runtime#COMMIT_SHA
-dsh-browser-runtime install chromium
-```
-
-`dsh-browser-runtime doctor` 会报告 Node 版本、插件版本、Playwright 版本、Chromium 是否存在
-及其实际路径、每个入口在 DSH Loader 眼中的导出形态、bundle patch 是否随包发布，以及 Provider
-是否可以打开环境。任何一项失败都会以非零码退出，profile 安装脚本可以据此设卡。
-
-Git 安装会执行本包的 `prepare` 构建。pnpm 10 默认拒绝该脚本，需要在 profile 的 `pnpm-workspace.yaml` 中允许精确包名：
-
-```yaml
-allowBuilds:
-  dsh-browser-runtime: true
-```
-
-授权构建前应审查并固定源码。发布到 npm 的包或 tarball 已携带构建产物，不需要该授权。
+- 每个精确 Agent 对象拥有一个隔离 BrowserContext 和一个 Page。
+- 同一 owner 的并发 acquire 共享初始化并返回独立 lease；不同 owner 永不共享环境。
+- 取消一个 acquire 或工具调用只终止该调用方的等待；其他等待方仍可完成 owner 共享初始化。
+- 取消正在执行的浏览器操作会释放可能已不可用的 Agent lease；下一次工具调用会打开或恢复新环境。
+- 同一环境的操作按 FIFO 执行；不同环境可以并行。
+- 每次 observation 生成 `e1` 之类的局部引用；只有最新 observation 的引用可以执行。
+- observation 按五个层级排序——表单控件与分页、站点导航、记录标题、正文链接、重复的记录内链接——因此预算裁剪会先丢弃作者链接，而不是分页链接。重复的页面记录会折叠成 `g1` 这样的分组，`dt`/`dd` 一对算作同一条记录。
+- `browser_observe` 接受 `mode`（`summary`、`interactive`、`document`）以及 `max_text_chars` 和 `max_elements`。`browser_observe_next` 在不重新观察的前提下继续读取最新 observation，因此翻页期间元素引用保持有效。
+- 每个 action 都生成带耗时与输出规模指标的 before/after transition 证据；fill 内容不会写入 Runtime 证据。
+- 工具失败会追加一行可路由信息：`code`、`url`、`observation`、`lease`、`recommended_action`、`retryable`。系统不会自动重试，因为失败的点击仍可能已经发生跳转。
+- 紧凑 transition 索引写入失败会记录一条运维警告，但不会改变 action 成功、Provider 失败或取消的结果；当前进程的查询会保留有界内存记录。
+- 截图通过 `ctx.attachments` 保存为 PNG，模型不能指定宿主机路径。
+- `resume` 保存 cookie 和 localStorage；恢复后 generation 增加，旧 page、observation、element 身份全部失效。同一 session 的 checkpoint payload 创建、索引提交或回滚以及旧 payload 清理会跨 owner 串行执行；一个 Provider 不能替换另一个 Provider 的 session checkpoint。
+- Provider 卸载会在 Provider 级资源释放前中止并等待选择与初始化；最后一个 lease 释放、Agent 销毁和 Runtime 卸载也会等待浏览器资源清理完成。
 
 ## 配置
 
-Bundle 的 [`cordis.patch.yml`](cordis.patch.yml) 默认选择 Playwright、使用 ephemeral Agent 环境、阻止私网访问，并注册全部工具。用户 profile 可以按 id 替换任意行；DSH patch 会替换整段 `config`，因此覆盖时必须重述该行的全部字段。
+Bundle 的 [`cordis.patch.yml`](cordis.patch.yml) 默认选择 Playwright、使用 ephemeral Agent 环境、阻止私网访问，并注册完整的浏览器工具组。用户 profile 可以按 id 替换任意行；DSH patch 会替换整段 `config`，因此覆盖时必须重述该行的全部字段。
 
 Runtime 行：
 
@@ -178,9 +173,9 @@ Playwright 行：
 - id: tool-browser
   config:
     provider: playwright
-    persistence: ephemeral # 或 resume
+    persistence: ephemeral # or resume
     timeoutMs: 30000
-    observeMode: summary # 或 interactive、document
+    observeMode: summary # or interactive, document
     maxTextChars: 12000
     maxElements: 100
     # credentials:
@@ -237,4 +232,44 @@ Proxy 与浏览器启动限制属于应用层出站限制，不是操作系统�
 
 popup 接管、下载、上传、任意 JavaScript、连接真实 Chrome、跨 Provider checkpoint 转换、IndexedDB/sessionStorage 恢复，以及通用的非浏览器 Environment API。Checkpoint payload 是磁盘上的 owner-only 文件，而不是加密或受密钥管理的存储。目前没有专用的浏览器 Web UI，也没有用于连接运行中 Chrome 的 CDP Provider。Playwright 管理的 Chromium 需要单独安装。
 
-Provider 扩展、所有权、失败与证据规则见[架构说明](docs/architecture.zh.md)。
+## 开发与测试
+
+```sh
+pnpm install
+node lib/cli/index.js install chromium
+pnpm run typecheck
+pnpm run test:coverage
+pnpm run build
+pnpm run lint:package
+pnpm run verify:package
+pnpm run verify:tarball
+```
+
+如果 Playwright 管理的 Chromium 存在，`pnpm test` 会启动真实本地 HTTP server 和 Chromium；没有 Chromium 时 Playwright 测试会自行跳过，CI 会明确安装 Chromium。
+
+### 场景覆盖
+
+| 场景 | 覆盖它的测试 |
+|---|---|
+| 打开公开静态网页 | `playwright.integration.spec.ts` |
+| 填写搜索框并按 Enter | `playwright-observation.integration.spec.ts` |
+| 使用 action 返回的新 observation | `browser-tools.spec.ts`、`tool.integration.spec.ts` |
+| 用已被替换的引用操作并得到 stale 错误 | `browser-tools.spec.ts`、`playwright-observation.integration.spec.ts` |
+| 点击后页面异步更新 | `playwright-observation.integration.spec.ts` |
+| 下拉框、复选框和滚动 | `playwright-observation.integration.spec.ts` |
+| 完整页面截图 | `playwright.integration.spec.ts` |
+| 私网默认拒绝、白名单允许 | `network-policy.spec.ts`；真实浏览器套件都在 `mode: allowlist` 下运行 |
+| Cookie/localStorage checkpoint 恢复 | `playwright.integration.spec.ts`、`storage.integration.spec.ts` |
+| 操作取消后 lease 重建 | `tool.integration.spec.ts` |
+| 两个 Agent 并行隔离 | `browser-tools.spec.ts`、`runtime.spec.ts` |
+| Provider 卸载与资源回收 | `runtime.spec.ts` |
+| Chromium 缺失诊断 | `startup-diagnostics.spec.ts`、`cli-main.spec.ts` |
+| 最终 tarball 能挂载并注册工具 | `verify:tarball` |
+
+`verify:tarball` 会把打包后的归档挂载到真实 Cordis Context 中，使用真实的 DSH tool、system-prompt 与 attachment 服务，并对解压后的文件运行 `doctor`。它不是一次 `dsh` profile 安装：这里没有任何环节驱动 `dsh` CLI，因此最后一步——`dsh plugin --profile web add -w …` 之后真实启动 profile——仍需在装有 DSH 的机器上手动验证。
+
+`verify:package` 针对构建产物运行发布物门禁，`verify:tarball` 则先打包、解压，再针对 profile 实际安装的那份归档重跑一遍：每个 `exports` 子路径都能解析、函数式插件入口没有 default 导出、真实的 `Loader.unwrapExports` 保留了它们的 `inject`/`Config`/`name`、三个入口都能在真实 Cordis Context 中挂载、`doctor` 针对解压后的文件运行，并输出包版本、源码提交和入口的完整性摘要。
+
+### 打包约定
+
+两个函数式插件入口只使用具名导出。DSH Loader 用 `exports.default ?? exports` 解析导入的模块，因此 default 导出会丢弃 `inject`、`Config` 和 `name`，Provider 会在 `ctx.browserRuntime` 处失败。default 导出只保留给把 `inject` 和 `Config` 作为静态属性携带的 Service 或 class 插件，所以 Runtime 入口保留 `export { BrowserRuntime as default }`。`pnpm run verify:tarball` 会针对打包后的归档执行这条规则。
