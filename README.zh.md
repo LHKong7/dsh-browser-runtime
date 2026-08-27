@@ -10,9 +10,11 @@
 |---|---|---|
 | `dsh-browser-runtime` | Service Definition 与控制面 | `ctx.browserRuntime` |
 | `dsh-browser-runtime/playwright` | Playwright/Chromium Provider | Provider id `playwright` |
-| `dsh-browser-runtime/tools` | 面向模型的 Consumer | 五个 `browser_*` 工具 |
+| `dsh-browser-runtime/tools` | 面向模型的 Consumer | 一组 `browser_*` 工具 |
 
 单包结构支持 `dsh plugin add github:...`。源码仍按三个角色分目录；如果它们以后需要独立发布节奏，可以直接拆成不同 npm 包。
+
+两个函数式插件入口只使用具名导出。DSH Loader 用 `exports.default ?? exports` 解析导入的模块，因此 default 导出会丢弃 `inject`、`Config` 和 `name`，Provider 会在 `ctx.browserRuntime` 处失败。default 导出只保留给把 `inject` 和 `Config` 作为静态属性携带的 Service 或 class 插件，所以 runtime 入口保留 `export { BrowserRuntime as default }`。`pnpm run verify:tarball` 会针对打包后的归档执行这条规则。
 
 ## v0.1 行为
 
@@ -22,7 +24,10 @@
 - 取消正在执行的浏览器操作会释放可能已不可用的 Agent lease；下一次工具调用会打开或恢复新环境。
 - 同一环境的操作按 FIFO 执行；不同环境可以并行。
 - 每次 observation 生成 `e1` 之类的局部引用；只有最新 observation 的引用可以执行。
-- `navigate`、`click`、`fill` 生成 before/after transition 证据；fill 内容不会写入 Runtime 证据。
+- observation 按五个层级排序——表单控件与分页、站点导航、记录标题、正文链接、重复的记录内链接——因此预算裁剪会先丢弃作者链接，而不是分页链接。重复的页面记录会折叠成 `g1` 这样的分组，`dt`/`dd` 一对算作同一条记录。
+- `browser_observe` 接受 `mode`（`summary`、`interactive`、`document`）以及 `max_text_chars` 和 `max_elements`。`browser_observe_next` 在不重新观察的前提下继续读取最新 observation，因此翻页期间元素引用保持有效。
+- 每个 action 都生成带耗时与输出规模指标的 before/after transition 证据；fill 内容不会写入 Runtime 证据。
+- 工具失败会追加一行可路由信息：`code`、`url`、`observation`、`lease`、`recommended_action`、`retryable`。系统不会自动重试，因为失败的点击仍可能已经发生跳转。
 - 紧凑 transition 索引写入失败会记录一条运维警告，但不会改变 action 成功、Provider 失败或取消的结果；当前进程的查询会保留有界内存记录。
 - 截图通过 `ctx.attachments` 保存为 PNG，模型不能指定宿主机路径。
 - `resume` 保存 cookie 和 localStorage；恢复后 generation 增加，旧 page、observation、element 身份全部失效。同一 session 的 checkpoint payload 创建、索引提交或回滚以及旧 payload 清理会跨 owner 串行执行；一个 Provider 不能替换另一个 Provider 的 session checkpoint。
@@ -33,10 +38,21 @@
 | 工具 | 用途 |
 |---|---|
 | `browser_open` | 打开 HTTP(S) URL 并返回 observation |
-| `browser_observe` | 刷新页面文本和交互元素引用 |
+| `browser_observe` | 按指定模式刷新页面文本和交互元素引用 |
+| `browser_observe_next` | 继续读取最新 observation 的下一页 |
 | `browser_click` | 点击最新 observation 中的引用 |
 | `browser_fill` | 向非密码输入项写入非敏感文本 |
+| `browser_fill_credential` | 用按名引用的已存凭据填写输入项 |
+| `browser_press` | 向引用或当前焦点元素发送一个白名单按键 |
+| `browser_select` | 在 select 引用中选择选项 |
+| `browser_check` | 设置复选框或单选框引用的状态 |
+| `browser_scroll` | 按视口倍数、到页首页尾或滚动到引用 |
+| `browser_back` / `browser_forward` / `browser_reload` | 在本环境自己的历史中前后移动 |
+| `browser_wait` | 等待页面或元素状态后再观察 |
 | `browser_screenshot` | 保存视口或整页 PNG attachment |
+| `browser_extract_list` / `_table` / `_links` / `_article` | 从某个区域读取结构化内容 |
+
+只有在配置了凭据来源时才会注册 `browser_fill_credential`。提取工具接受最新 observation 中的 `region_ref`，既不接受 selector 也不接受 JavaScript；元素引用会扩展到调用方真正指的那个区域，因此指定某条记录的链接就能提取整个列表。浏览器适合交互式页面：面对数百或数千条静态数据时，官方 API 或直接 fetch 优于逐页点击，系统提示中也这样说明。
 
 ## 开发与测试
 
@@ -101,7 +117,7 @@ allowBuilds:
 
 ## 配置
 
-Bundle 的 [`cordis.patch.yml`](cordis.patch.yml) 默认选择 Playwright、使用 ephemeral Agent 环境、阻止私网访问，并注册全部五个工具。用户 profile 可以按 id 替换任意行；DSH patch 会替换整段 `config`，因此覆盖时必须重述该行的全部字段。
+Bundle 的 [`cordis.patch.yml`](cordis.patch.yml) 默认选择 Playwright、使用 ephemeral Agent 环境、阻止私网访问，并注册全部工具。用户 profile 可以按 id 替换任意行；DSH patch 会替换整段 `config`，因此覆盖时必须重述该行的全部字段。
 
 Runtime 行：
 
@@ -112,6 +128,8 @@ Runtime 行：
     maxTextChars: 60000
     maxTransitionsInMemory: 500
     cleanupTimeoutMs: 10000
+    checkpointTtlMs: 0
+    maxCheckpoints: 100
 ```
 
 Playwright 行：
@@ -125,7 +143,11 @@ Playwright 行：
     maxElements: 100
     maxScreenshotPixels: 16000000
     maxScreenshotBytes: 16777216
-    allowPrivateNetwork: false
+    network:
+      mode: strict # strict | allowlist | unrestricted
+      allowHosts: []
+      allowCidrs: []
+      denyCidrs: []
     # checkpointRoot: /private/absolute/path
 ```
 
@@ -137,7 +159,18 @@ Playwright 行：
     provider: playwright
     persistence: ephemeral # 或 resume
     timeoutMs: 30000
+    observeMode: summary # 或 interactive、document
+    maxTextChars: 12000
+    maxElements: 100
+    # credentials:
+    #   requireApproval: true
+    #   refs:
+    #     ci-token: DSH_BROWSER_CI_TOKEN
 ```
+
+`observeMode` 决定未指定模式时使用的默认模式，`maxTextChars`/`maxElements` 限制单次响应最多携带的内容。Runtime 行的 `maxTextChars` 是另一个上限，约束一次 observation 从页面保留多少文本。
+
+Runtime 的 checkpoint 保留由 `checkpointTtlMs`（`0` 表示永久保留）和 `maxCheckpoints` 限制。持久索引加载时会执行一次裁剪；`ctx.browserRuntime.pruneCheckpoints()` 和 `listCheckpoints()` 对外暴露该能力，`dsh-browser-runtime checkpoints [--clear]` 可以列出或删除 Provider 私有 payload。每条记录都保存写入它的 Provider build，恢复时会拒绝由其他 build 写入的 payload。
 
 `persistence: resume` 可以在同一进程内从 Runtime 内存索引恢复。跨进程恢复还需要 DSH 的 `ctx.storageDomain`，Web profile 已经挂载该服务。Checkpoint 元数据写入 `browser_runtime` domain；Playwright 的敏感 storage-state payload 以 owner-only 权限存放在 `$DSH_HOME/browser-runtime/providers/playwright/v1/checkpoints`。
 
@@ -145,7 +178,19 @@ Playwright 行：
 
 默认 Provider 使用临时隔离的浏览器 profile 和经过清理的私有 `HOME`，阻止 service worker，不提供下载、上传、任意模型 JavaScript、模型 selector 或连接用户 Chrome profile 的 API。导航只接受不含内嵌凭据的 HTTP(S) URL。在 strict mode 中，每个 environment 都会把 HTTP(S)、`ws:`/`wss:` 和经代理的浏览器 TCP 流量发送到带认证的 loopback proxy。Proxy 只解析一次 hostname，要求全部结果符合地址策略，并只使用这些结果创建 upstream socket，避免浏览器选择另一条 DNS 结果。默认策略会拒绝 loopback、private、link-local、reserved 和 multicast 目标。
 
-Strict mode 还会在受管理的 Chromium build 中禁用 QUIC 和直连 WebRTC UDP，因此 WebTransport、HTTP/3、STUN 和 TURN 不能建立未经过代理的路径。`allowPrivateNetwork` 是显式 opt-in；它不会启动 policy proxy，也不会加入这些启动限制，因此允许 HTTP、WebSocket、UDP 与 QUIC 直接连接私网等目标。Playwright request route 仍会拒绝不支持的协议和包含内嵌凭据的 URL。Provider 只支持由固定 Playwright 版本管理的 Chromium build。
+Strict mode 还会在受管理的 Chromium build 中禁用 QUIC 和直连 WebRTC UDP，因此 WebTransport、HTTP/3、STUN 和 TURN 不能建立未经过代理的路径。
+
+`network.mode: allowlist` 保留上述全部控制，只额外放行 `allowHosts` 中的主机和 `allowCidrs` 中的网段。`allowHosts` 条目按 hostname 精确匹配；以点开头的条目同时匹配该主机及其子域。`denyCidrs` 会在任何放行之前检查，并在所有模式下生效，因此即使 profile 放行了 loopback，`169.254.0.0/16` 这类 link-local 网段仍不可达。请优先使用它，而不是旧开关：
+
+```yaml
+network:
+  mode: allowlist
+  allowHosts: [localhost, .dev.internal.example]
+  allowCidrs: [127.0.0.1/32]
+  denyCidrs: [169.254.0.0/16]
+```
+
+`network.mode: unrestricted` 不会启动 policy proxy，也不会加入这些启动限制，因此允许 HTTP、WebSocket、UDP 与 QUIC 直接连接私网等目标。已废弃的 `allowPrivateNetwork: true` 映射到该模式；把它和相互矛盾的 `network.mode` 一起配置会在加载时失败。所有模式下 Playwright request route 仍会拒绝不支持的协议和包含内嵌凭据的 URL。Provider 只支持由固定 Playwright 版本管理的 Chromium build。
 
 Provider 只暴露一个页面。如果 click 的有效 link 或 form target 会创建另一个 browsing context，该操作会在 dispatch 前以 `BROWSER_POLICY_DENIED` 失败。页面脚本调用 `window.open` 会得到 `null`，触发它的 action 也会收到相同 policy failure。其他意外 Page 会被关闭，并在 action 或 environment cleanup 完成前排空；v0.1 不会把 popup 交还给 Agent。
 
@@ -163,10 +208,12 @@ Observation 正文会在 Chromium 内按照 Runtime 的 `maxTextChars` 截断，
 
 `browser_fill` 不是秘密输入通道。DSH 会在插件执行前记录原始 tool-call 参数，因此写入 `value` 的秘密仍会进入 Session log，即使 Runtime transition 证据已经隐藏该值。密码输入框会被直接拒绝。
 
+`browser_fill_credential` 才是该通道。模型只提供 `credential_ref`；明文由部署挂载的 `ctx.browserCredentials` 服务或配置的环境变量映射解析，并直接交给 Provider。它不会进入模型请求、工具参数、transition 证据或 Session log——证据中只保留引用名和 `[REDACTED]`。除非关闭 `credentials.requireApproval`，每次填写都要经过 `ctx.approval`；要求审批却没有挂载审批服务时会拒绝全部填写，而不是放行。只有在配置了凭据来源时才会注册该工具。
+
 Proxy 与浏览器启动限制属于应用层出站限制，不是操作系统网络 sandbox。如果部署需要独立的网络边界，应使用宿主机防火墙或容器网络策略。
 
 ## v0.1 不包含
 
-popup 接管、下载、上传、任意 JavaScript、连接真实 Chrome、跨 Provider checkpoint 转换、IndexedDB/sessionStorage 恢复、凭据管理，以及通用的非浏览器 Environment API。Playwright 管理的 Chromium 需要单独安装。
+popup 接管、下载、上传、任意 JavaScript、连接真实 Chrome、跨 Provider checkpoint 转换、IndexedDB/sessionStorage 恢复，以及通用的非浏览器 Environment API。Checkpoint payload 是磁盘上的 owner-only 文件，而不是加密或受密钥管理的存储。目前没有专用的浏览器 Web UI，也没有用于连接运行中 Chrome 的 CDP Provider。Playwright 管理的 Chromium 需要单独安装。
 
 Provider 扩展、所有权、失败与证据规则见[架构说明](docs/architecture.zh.md)。

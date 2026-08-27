@@ -1,6 +1,8 @@
 # Agent Note: 对全部浏览器出站通道执行策略
 
-Status: implemented
+Status: implemented；其中关于 `allowPrivateNetwork` 的决定已被
+[把私网访问改成白名单，而不是开关](2026-08-27-network-allowlist.zh.md)取代——
+后者保留本文描述的全部控制，并用 `network.mode` 加主机、放行与拒绝列表替换该布尔值。
 
 [English](2026-08-27-browser-egress-policy.md) | 中文
 
