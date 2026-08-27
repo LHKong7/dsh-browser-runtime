@@ -51,6 +51,13 @@ export class MemoryAttachments extends AttachmentStore {
   }
 }
 
+/** One Agent bound to a mounted tool suite. */
+export interface HarnessAgent {
+  readonly ctx: Context
+  readonly agent: Agent
+  call(name: string, args: unknown, signal?: AbortSignal): Promise<ToolExecutionResult>
+}
+
 /** One mounted tool suite plus the Agent its calls belong to. */
 export interface ToolHarness {
   readonly ctx: Context
@@ -58,6 +65,8 @@ export interface ToolHarness {
   readonly agent: Agent
   readonly provider: FakeBrowserProvider
   call(name: string, args: unknown, signal?: AbortSignal): Promise<ToolExecutionResult>
+  /** Add a second Agent against the same suite, to check isolation. */
+  addAgent(name: string): HarnessAgent
   dispose(): Promise<void>
 }
 
@@ -81,28 +90,44 @@ export async function toolHarness(options: {
   await options.prepare?.(ctx)
   await ctx.plugin(ToolBrowser, { provider: 'fake', ...options.config })
 
-  const agentCtx = new Context()
-  const id = SessionId('tool-agent')
-  const agent = { id, ctx: agentCtx, session: { id } } as unknown as Agent
   let counter = 0
+  const extra: Context[] = []
 
+  const makeAgent = (name: string): HarnessAgent => {
+    const agentCtx = new Context()
+    const id = SessionId(name)
+    const agent = { id, ctx: agentCtx, session: { id } } as unknown as Agent
+    return {
+      ctx: agentCtx,
+      agent,
+      call(toolName, args, signal = new AbortController().signal) {
+        counter += 1
+        return ctx.tools.execute({
+          callId: CallId(`browser-call-${counter}`),
+          name: toolName,
+          arguments: args,
+          agent,
+          signal,
+        })
+      },
+    }
+  }
+
+  const primary = makeAgent('tool-agent')
   return {
     ctx,
-    agentCtx,
-    agent,
+    agentCtx: primary.ctx,
+    agent: primary.agent,
     provider,
-    call(name, args, signal = new AbortController().signal) {
-      counter += 1
-      return ctx.tools.execute({
-        callId: CallId(`browser-call-${counter}`),
-        name,
-        arguments: args,
-        agent,
-        signal,
-      })
+    call: primary.call,
+    addAgent(name) {
+      const created = makeAgent(name)
+      extra.push(created.ctx)
+      return created
     },
     async dispose() {
-      await agentCtx.fiber.dispose()
+      for (const agentContext of extra) await agentContext.fiber.dispose()
+      await primary.ctx.fiber.dispose()
       await ctx.fiber.dispose()
     },
   }

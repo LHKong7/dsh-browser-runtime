@@ -71,6 +71,27 @@ pnpm run verify:tarball
 
 `pnpm test` uses a real local HTTP server and Chromium when Playwright's managed browser is present. The Playwright suite self-skips when Chromium is absent; CI installs it explicitly.
 
+### Scenario coverage
+
+| Scenario | Covered by |
+|---|---|
+| Open a public static page | `playwright.integration.spec.ts` |
+| Fill a search box and press Enter | `playwright-observation.integration.spec.ts` |
+| Act on the observation an action returned | `browser-tools.spec.ts`, `tool.integration.spec.ts` |
+| Act on a superseded reference and get a stale error | `browser-tools.spec.ts`, `playwright-observation.integration.spec.ts` |
+| Asynchronous page update after a click | `playwright-observation.integration.spec.ts` |
+| Select, checkbox, and scroll | `playwright-observation.integration.spec.ts` |
+| Full-page screenshot | `playwright.integration.spec.ts` |
+| Private network denied by default, admitted by allowlist | `network-policy.spec.ts`; the real-browser suites run under `mode: allowlist` |
+| Cookie and localStorage checkpoint restore | `playwright.integration.spec.ts`, `storage.integration.spec.ts` |
+| Lease rebuilt after a cancelled operation | `tool.integration.spec.ts` |
+| Two Agents isolated in parallel | `browser-tools.spec.ts`, `runtime.spec.ts` |
+| Provider unload and resource reclamation | `runtime.spec.ts` |
+| Missing-Chromium diagnosis | `startup-diagnostics.spec.ts`, `cli-main.spec.ts` |
+| The final tarball mounts and registers its tools | `verify:tarball` |
+
+`verify:tarball` mounts the packed archive in a real Cordis Context with the real DSH tool, system-prompt, and attachment services, and runs `doctor` against the extracted files. It is not a `dsh` profile install: nothing here drives the `dsh` CLI, so the last mile — `dsh plugin --profile web add -w …` followed by a real profile start — still needs a manual check on a machine that has DSH.
+
 `verify:package` runs the artifact conformance gate over the built tree, and `verify:tarball` packs, extracts, and re-runs it over the exact archive a profile installs: every `exports` subpath resolves, the functional plugin entries carry no default export, the real `Loader.unwrapExports` keeps their `inject`/`Config`/`name`, all three entries mount in a real Cordis Context, `doctor` runs against the extracted files, and the report prints the package version, source commit, and an integrity digest of the entry points.
 
 ## Install into DeepSeek Harness

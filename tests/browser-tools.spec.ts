@@ -280,6 +280,59 @@ describe('transition metrics and failure evidence', () => {
   })
 })
 
+describe('two Agents sharing one tool suite', () => {
+  beforeEach(async () => {
+    harness = await toolHarness({ config: { observeMode: 'interactive' } })
+  })
+
+  it('gives each Agent its own environment and rejects the other\'s references', async () => {
+    const second = harness.addAgent('second-agent')
+
+    const [openedFirst, openedSecond] = await Promise.all([
+      harness.call('browser_open', { url: 'https://first.test/' }),
+      second.call('browser_open', { url: 'https://second.test/' }),
+    ])
+    expect(openedFirst.isError, openedFirst.error?.message).toBe(false)
+    expect(openedSecond.isError, openedSecond.error?.message).toBe(false)
+
+    const first = (openedFirst.value as unknown as ActionResult).observation
+    const other = (openedSecond.value as unknown as ActionResult).observation
+    expect(first.environment_id).not.toBe(other.environment_id)
+    expect(first.url).toBe('https://first.test/')
+    expect(other.url).toBe('https://second.test/')
+    expect(harness.provider.opens).toBe(2)
+
+    // An observation minted for one Agent is not addressable from the other.
+    const crossed = await second.call('browser_click', {
+      observation_id: first.id,
+      element_ref: first.elements[0]?.ref,
+    })
+    expect(crossed.isError).toBe(true)
+    expect(crossed.error?.info?.code).toBe('BROWSER_STALE_REFERENCE')
+
+    // Each Agent's own reference still acts against its own page.
+    const own = await second.call('browser_click', {
+      observation_id: other.id,
+      element_ref: other.elements[0]?.ref,
+    })
+    expect(own.isError, own.error?.message).toBe(false)
+  })
+
+  it('releases only the disposed Agent\'s environment', async () => {
+    const second = harness.addAgent('disposable-agent')
+    await harness.call('browser_open', { url: 'https://kept.test/' })
+    await second.call('browser_open', { url: 'https://dropped.test/' })
+    expect(harness.provider.opens).toBe(2)
+
+    await second.ctx.fiber.dispose()
+    expect(harness.provider.environments.filter(environment => environment.closes > 0)).toHaveLength(1)
+
+    const still = await harness.call('browser_observe', {})
+    expect(still.isError, still.error?.message).toBe(false)
+    expect(harness.provider.opens).toBe(2)
+  })
+})
+
 describe('structured extraction', () => {
   beforeEach(async () => {
     harness = await toolHarness()

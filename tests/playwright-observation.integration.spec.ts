@@ -244,10 +244,19 @@ describe.skipIf(!hasChromium)('interaction tools in a real browser', () => {
             <option value="b">Beta</option>
           </select>
           <input type="checkbox" id="agree" aria-label="Agree">
+          <button id="load">Load results</button>
+          <ul id="results"></ul>
           <div style="height:4000px"></div>
           <button id="deep">Deep button</button>
           <p id="state"></p>
           <script>
+            document.getElementById('load').addEventListener('click', () => {
+              setTimeout(() => {
+                document.getElementById('results').innerHTML =
+                  '<li><a href="/search?q=1">Async result 1</a></li>'
+                  + '<li><a href="/search?q=2">Async result 2</a></li>'
+              }, 250)
+            })
             document.getElementById('agree').addEventListener('change', (event) => {
               document.getElementById('state').textContent = 'agree=' + event.target.checked
             })
@@ -354,6 +363,30 @@ describe.skipIf(!hasChromium)('interaction tools in a real browser', () => {
   it('denies a history move the environment has no entry for', async () => {
     await expect(lease.act({ type: 'history', direction: 'forward' }))
       .rejects.toMatchObject({ code: 'BROWSER_POLICY_DENIED' })
+  })
+
+  it('observes an asynchronous update only after waiting for it', async () => {
+    // The SPA case: a click mutates the page later, so the observation taken
+    // straight after the click is genuinely the pre-update page.
+    const trigger = await refFor((_kind, name) => name === 'Load results')
+    const clicked = await lease.act({
+      type: 'click',
+      observationId: trigger.observationId,
+      elementRef: trigger.ref,
+    })
+    expect(clicked.after?.text).not.toContain('Async result 1')
+
+    const pending = await lease.observe()
+    expect(pending.elements.some(element => element.name === 'Async result 1')).toBe(false)
+
+    const settled = await lease.act({ type: 'wait', until: 'network-idle', timeoutMs: 5_000 })
+    expect(settled.after?.text).toContain('Async result 1')
+    expect(settled.after?.elements.some(element => element.name === 'Async result 1')).toBe(true)
+  })
+
+  it('requires an element reference for the element wait conditions', async () => {
+    await expect(lease.act({ type: 'wait', until: 'element-visible' }))
+      .rejects.toMatchObject({ code: 'BROWSER_INVALID_ARGUMENT' })
   })
 
   it('waits for load state and for an element to become visible', async () => {

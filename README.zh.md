@@ -71,6 +71,27 @@ pnpm run verify:tarball
 
 如果 Playwright 管理的 Chromium 存在，`pnpm test` 会启动真实本地 HTTP server 和 Chromium；没有 Chromium 时 Playwright 测试会自行跳过，CI 会明确安装 Chromium。
 
+### 场景覆盖
+
+| 场景 | 覆盖它的测试 |
+|---|---|
+| 打开公开静态网页 | `playwright.integration.spec.ts` |
+| 填写搜索框并按 Enter | `playwright-observation.integration.spec.ts` |
+| 使用 action 返回的新 observation | `browser-tools.spec.ts`、`tool.integration.spec.ts` |
+| 用已被替换的引用操作并得到 stale 错误 | `browser-tools.spec.ts`、`playwright-observation.integration.spec.ts` |
+| 点击后页面异步更新 | `playwright-observation.integration.spec.ts` |
+| 下拉框、复选框和滚动 | `playwright-observation.integration.spec.ts` |
+| 完整页面截图 | `playwright.integration.spec.ts` |
+| 私网默认拒绝、白名单允许 | `network-policy.spec.ts`；真实浏览器套件都在 `mode: allowlist` 下运行 |
+| Cookie/localStorage checkpoint 恢复 | `playwright.integration.spec.ts`、`storage.integration.spec.ts` |
+| 操作取消后 lease 重建 | `tool.integration.spec.ts` |
+| 两个 Agent 并行隔离 | `browser-tools.spec.ts`、`runtime.spec.ts` |
+| Provider 卸载与资源回收 | `runtime.spec.ts` |
+| Chromium 缺失诊断 | `startup-diagnostics.spec.ts`、`cli-main.spec.ts` |
+| 最终 tarball 能挂载并注册工具 | `verify:tarball` |
+
+`verify:tarball` 会把打包后的归档挂载到真实 Cordis Context 中，使用真实的 DSH tools、system-prompt 与 attachment 服务，并对解压后的文件运行 `doctor`。它不是一次 `dsh` profile 安装：这里没有任何环节驱动 `dsh` CLI，因此最后一步——`dsh plugin --profile web add -w …` 之后真实启动 profile——仍需在装有 DSH 的机器上手动验证。
+
 `verify:package` 针对构建产物运行发布物门禁，`verify:tarball` 则先打包、解压，再针对 profile 实际安装的那份归档重跑一遍：每个 `exports` 子路径都能解析、函数式插件入口没有 default 导出、真实的 `Loader.unwrapExports` 保留了它们的 `inject`/`Config`/`name`、三个入口都能在真实 Cordis Context 中挂载、`doctor` 针对解压后的文件运行，并输出包版本、源码提交和入口的完整性摘要。
 
 ## 安装到 DeepSeek Harness
