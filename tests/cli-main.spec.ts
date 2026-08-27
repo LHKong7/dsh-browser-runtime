@@ -53,6 +53,12 @@ describe('dsh-browser-runtime CLI', () => {
     expect(text).toContain('firefox, webkit')
   })
 
+  it('reports an empty checkpoint store without creating it', async () => {
+    const { out } = capture()
+    expect(await main(['checkpoints'])).toBe(0)
+    expect(out.join('')).toMatch(/No stored browser checkpoints/)
+  })
+
   it.skipIf(!built)('reports every check and exits on the Chromium result', async () => {
     const { out } = capture()
     const code = await main(['doctor'])

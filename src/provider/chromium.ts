@@ -56,3 +56,8 @@ export function chromiumMissingMessage(installation: ChromiumInstallation): stri
     'Run: dsh-browser-runtime install chromium',
   ].join('\n')
 }
+
+/** Default provider-private directory holding Playwright checkpoint payloads. */
+export function defaultCheckpointRoot(dshHome: string): string {
+  return join(dshHome, 'browser-runtime', 'providers', 'playwright', 'v1', 'checkpoints')
+}

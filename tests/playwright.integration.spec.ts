@@ -773,7 +773,7 @@ describe.skipIf(!hasChromium)('Playwright provider against a local deterministic
       await context.routeWebSocket(/.*/, async (websocket) => {
         routed += 1
         await routeWebSocketWithNetworkPolicy(
-          new NetworkPolicy({ allowPrivateNetwork: false }),
+          new NetworkPolicy({ mode: 'strict' }),
           {
             url: websocket.url(),
             connect: () => { websocket.connectToServer() },

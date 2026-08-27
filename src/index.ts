@@ -2,6 +2,7 @@
 
 export {
   BrowserRuntimeError,
+  BrowserProviderCheckpointMissingError,
   BrowserProviderPolicyError,
   BrowserProviderTargetStaleError,
   browserFailureLine,

@@ -24,7 +24,11 @@ import type {
   Response,
 } from 'playwright'
 import { z as zod } from 'zod'
-import { BrowserProviderPolicyError, BrowserProviderTargetStaleError } from '../runtime/error.ts'
+import {
+  BrowserProviderCheckpointMissingError,
+  BrowserProviderPolicyError,
+  BrowserProviderTargetStaleError,
+} from '../runtime/error.ts'
 import { BrowserCheckpointRef, BrowserPageId, BrowserProviderId } from '../runtime/types.ts'
 import type {
   BrowserExtraction,
@@ -42,7 +46,7 @@ import type {
   BrowserCheckpointRef as BrowserCheckpointRefType,
 } from '../runtime/types.ts'
 import type {} from '../runtime/runtime.ts'
-import { chromiumMissingMessage, readChromiumInstallation } from './chromium.ts'
+import { chromiumMissingMessage, defaultCheckpointRoot, readChromiumInstallation } from './chromium.ts'
 import {
   extractStructuredContent,
   scrollViewport,
@@ -50,7 +54,13 @@ import {
   snapshotElements,
   snapshotScreenshotLayout,
 } from './page-snapshot.ts'
-import { NetworkPolicy, routeWebSocketWithNetworkPolicy, routeWithNetworkPolicy } from './network-policy.ts'
+import {
+  NetworkPolicy,
+  routeWebSocketWithNetworkPolicy,
+  routeWithNetworkPolicy,
+  usesPolicyProxy,
+} from './network-policy.ts'
+import type { NetworkPolicyConfig, NetworkPolicyMode } from './network-policy.ts'
 import {
   chromiumNetworkArgs,
   NETWORK_PROXY_AUTHENTICATION_URL,
@@ -78,10 +88,28 @@ export interface Config {
   readonly maxScreenshotPixels?: number
   /** Maximum encoded PNG bytes returned by one screenshot. */
   readonly maxScreenshotBytes?: number
-  /** Permit loopback, link-local, and private network destinations. */
+  /**
+   * Egress policy. `strict` admits only public unicast destinations;
+   * `allowlist` adds named hosts and CIDRs while keeping the policy proxy, DNS
+   * pinning, and the Chromium egress restrictions; `unrestricted` removes them.
+   */
+  readonly network?: NetworkPolicyConfigInput
+  /**
+   * Deprecated coarse switch retained for existing profiles. `true` is
+   * equivalent to `network.mode: unrestricted`; prefer the allowlist.
+   * @deprecated use `network` instead.
+   */
   readonly allowPrivateNetwork?: boolean
   /** Provider-private checkpoint directory. */
   readonly checkpointRoot?: string
+}
+
+/** Egress policy as a profile writes it. */
+export interface NetworkPolicyConfigInput {
+  readonly mode?: NetworkPolicyMode
+  readonly allowHosts?: string[]
+  readonly allowCidrs?: string[]
+  readonly denyCidrs?: string[]
 }
 
 interface ResolvedConfig {
@@ -91,7 +119,7 @@ interface ResolvedConfig {
   readonly maxElements: number
   readonly maxScreenshotPixels: number
   readonly maxScreenshotBytes: number
-  readonly allowPrivateNetwork: boolean
+  readonly network: NetworkPolicyConfig
   readonly checkpointRoot: string
 }
 
@@ -152,6 +180,12 @@ export const Config: z<Config> = z.object({
   maxElements: z.number().default(100),
   maxScreenshotPixels: z.number().default(16_000_000),
   maxScreenshotBytes: z.number().default(16 * 1024 * 1024),
+  network: z.object({
+    mode: z.union(['strict', 'allowlist', 'unrestricted'] as const).default('strict'),
+    allowHosts: z.array(z.string()).default([]),
+    allowCidrs: z.array(z.string()).default([]),
+    denyCidrs: z.array(z.string()).default([]),
+  }),
   allowPrivateNetwork: z.boolean().default(false),
   checkpointRoot: z.string(),
 })
@@ -159,6 +193,11 @@ export const Config: z<Config> = z.object({
 /** Playwright implementation of the BrowserProvider interface. */
 export class PlaywrightBrowserProvider implements BrowserProvider {
   readonly id = PLAYWRIGHT_PROVIDER_ID
+  /**
+   * The pinned Playwright version. Checkpoint payloads are Playwright storage
+   * state, so a payload written by another build is not this build's to read.
+   */
+  readonly version = readChromiumInstallation().playwrightVersion
   readonly capabilities = {
     checkpoint: true,
     screenshot: true,
@@ -195,7 +234,10 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
       `provider=${this.id}`,
       `chromium=${installation.installed ? 'available' : 'missing'}`,
       `headless=${this.config.headless}`,
-      `networkPolicy=${this.config.allowPrivateNetwork ? 'allow-private' : 'strict'}`,
+      `networkPolicy=${this.config.network.mode}`,
+      ...(this.config.network.mode === 'allowlist'
+        ? [`networkAllow=${describeAllowance(this.config.network)}`]
+        : []),
     ]
   }
 
@@ -231,14 +273,14 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
     let context: BrowserContext | undefined
     let networkProxy: NetworkPolicyProxy | undefined
     try {
-      const policy = new NetworkPolicy({ allowPrivateNetwork: this.config.allowPrivateNetwork })
-      if (!this.config.allowPrivateNetwork) networkProxy = new NetworkPolicyProxy(policy)
+      const policy = new NetworkPolicy(this.config.network)
+      if (usesPolicyProxy(policy.mode)) networkProxy = new NetworkPolicyProxy(policy)
       const proxy = await networkProxy?.listen(request.signal)
       browser = await chromium.launch({
         headless: this.config.headless,
         env: chromiumEnvironment(controlHome),
         ...(proxy === undefined ? {} : { proxy }),
-        args: ['--deny-permission-prompts', ...chromiumNetworkArgs(this.config.allowPrivateNetwork)],
+        args: ['--deny-permission-prompts', ...chromiumNetworkArgs(this.config.network.mode)],
       })
       request.signal.throwIfAborted()
       context = await browser.newContext({
@@ -274,7 +316,15 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
   }
 
   private async readCheckpoint(ref: BrowserCheckpointRefType): Promise<BrowserContextOptions['storageState']> {
-    const raw = await readFile(this.checkpointPath(ref), 'utf8')
+    let raw: string
+    try {
+      raw = await readFile(this.checkpointPath(ref), 'utf8')
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === 'ENOENT') {
+        throw new BrowserProviderCheckpointMissingError(`Playwright checkpoint payload ${ref} no longer exists`)
+      }
+      throw error
+    }
     return checkpointStateSchema.parse(JSON.parse(raw))
   }
 
@@ -1119,16 +1169,48 @@ function resolveConfig(config: Config): ResolvedConfig {
     maxElements,
     maxScreenshotPixels,
     maxScreenshotBytes,
-    allowPrivateNetwork: config.allowPrivateNetwork ?? false,
-    checkpointRoot: resolve(config.checkpointRoot ?? join(
-      resolveDshHome(),
-      'browser-runtime',
-      'providers',
-      'playwright',
-      'v1',
-      'checkpoints',
-    )),
+    network: resolveNetworkConfig(config),
+    checkpointRoot: resolve(config.checkpointRoot ?? defaultCheckpointRoot(resolveDshHome())),
   }
+}
+
+/**
+ * Fold the deprecated `allowPrivateNetwork` switch into the egress policy.
+ *
+ * The old switch is coarse: it removed the policy proxy and every Chromium
+ * egress restriction to reach one private host. It still maps to
+ * `unrestricted` so existing profiles keep working, but combining it with an
+ * explicit mode is a contradiction rather than a merge.
+ */
+function resolveNetworkConfig(config: Config): NetworkPolicyConfig {
+  const requested = config.network
+  if (config.allowPrivateNetwork === true) {
+    if (requested?.mode !== undefined && requested.mode !== 'unrestricted') {
+      throw new Error(
+        `browser-playwright: allowPrivateNetwork conflicts with network.mode "${requested.mode}"; set only network`,
+      )
+    }
+    return {
+      mode: 'unrestricted',
+      allowHosts: requested?.allowHosts ?? [],
+      allowCidrs: requested?.allowCidrs ?? [],
+      denyCidrs: requested?.denyCidrs ?? [],
+    }
+  }
+  return {
+    mode: requested?.mode ?? 'strict',
+    allowHosts: requested?.allowHosts ?? [],
+    allowCidrs: requested?.allowCidrs ?? [],
+    denyCidrs: requested?.denyCidrs ?? [],
+  }
+}
+
+/** One-line summary of what an allowlist admits beyond public unicast. */
+function describeAllowance(network: NetworkPolicyConfig): string {
+  const entries = [...(network.allowHosts ?? []), ...(network.allowCidrs ?? [])]
+  const denied = network.denyCidrs ?? []
+  const allowed = entries.length === 0 ? 'none' : entries.join(',')
+  return denied.length === 0 ? allowed : `${allowed} deny=${denied.join(',')}`
 }
 
 function chromiumEnvironment(controlHome: string): Record<string, string> {

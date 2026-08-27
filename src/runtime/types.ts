@@ -382,6 +382,12 @@ export interface BrowserCheckpointRecord {
   readonly environmentId: BrowserEnvironmentId
   readonly generation: number
   readonly providerId: BrowserProviderId
+  /**
+   * Provider build that wrote the payload. A restore refuses a payload from a
+   * different build, because the payload format is provider-private.
+   * Absent only on records written before this package tracked it.
+   */
+  readonly providerVersion?: string
   readonly ref: BrowserCheckpointRef
   readonly coverage: readonly BrowserCheckpointCoverage[]
   readonly createdAt: string
@@ -588,6 +594,11 @@ export interface BrowserProviderEnvironment {
 export interface BrowserProvider {
   readonly id: BrowserProviderId
   readonly capabilities: BrowserProviderCapabilities
+  /**
+   * Build identity of this provider, recorded with each checkpoint so a restore
+   * can refuse a payload written by an incompatible build.
+   */
+  readonly version?: string
   /** Report whether this process can open an environment. */
   available(): boolean | Promise<boolean>
   /**

@@ -29,7 +29,7 @@ describe('authenticated browser policy proxy', () => {
       response.end('proxied')
     })
     await listen(target)
-    const proxy = new NetworkPolicyProxy(new NetworkPolicy({ allowPrivateNetwork: true }))
+    const proxy = new NetworkPolicyProxy(new NetworkPolicy({ mode: 'unrestricted' }))
     const settings = await proxy.listen(new AbortController().signal)
     const targetUrl = `http://127.0.0.1:${portOf(target)}/resource`
     try {
@@ -50,7 +50,7 @@ describe('authenticated browser policy proxy', () => {
       response.end('unexpected')
     })
     await listen(target)
-    const proxy = new NetworkPolicyProxy(new NetworkPolicy({ allowPrivateNetwork: false }))
+    const proxy = new NetworkPolicyProxy(new NetworkPolicy({ mode: 'strict' }))
     const settings = await proxy.listen(new AbortController().signal)
     try {
       const result = await proxyRequest(settings, `http://127.0.0.1:${portOf(target)}/`, true)
@@ -70,7 +70,7 @@ describe('authenticated browser policy proxy', () => {
     })
     await listen(target)
     const targetAuthority = `127.0.0.1:${portOf(target)}`
-    const allowedProxy = new NetworkPolicyProxy(new NetworkPolicy({ allowPrivateNetwork: true }))
+    const allowedProxy = new NetworkPolicyProxy(new NetworkPolicy({ mode: 'unrestricted' }))
     const allowedSettings = await allowedProxy.listen(new AbortController().signal)
     try {
       await expect(proxyConnect(allowedSettings, targetAuthority)).resolves.toBe(200)
@@ -80,7 +80,7 @@ describe('authenticated browser policy proxy', () => {
     }
 
     targetConnections = 0
-    const strictProxy = new NetworkPolicyProxy(new NetworkPolicy({ allowPrivateNetwork: false }))
+    const strictProxy = new NetworkPolicyProxy(new NetworkPolicy({ mode: 'strict' }))
     const strictSettings = await strictProxy.listen(new AbortController().signal)
     try {
       await expect(proxyConnect(strictSettings, targetAuthority)).resolves.toBe(403)
@@ -113,7 +113,7 @@ describe('authenticated browser policy proxy', () => {
         }
       }
     }
-    const proxy = new NetworkPolicyProxy(new DelayedPolicy({ allowPrivateNetwork: true }))
+    const proxy = new NetworkPolicyProxy(new DelayedPolicy({ mode: 'unrestricted' }))
     const settings = await proxy.listen(new AbortController().signal)
     const request = proxyRequest(settings, `http://127.0.0.1:${portOf(target)}/`, true)
       .then(() => 'fulfilled' as const, () => 'rejected' as const)
@@ -142,7 +142,7 @@ describe('authenticated browser policy proxy', () => {
         return mappedTarget(rawUrl)
       }
     }
-    const proxy = new NetworkPolicyProxy(new DelayedPolicy({ allowPrivateNetwork: true }))
+    const proxy = new NetworkPolicyProxy(new DelayedPolicy({ mode: 'unrestricted' }))
     const settings = await proxy.listen(new AbortController().signal)
     const proxyUrl = new URL(settings.server)
     const client = createHttpRequest({
@@ -178,12 +178,12 @@ describe.skipIf(!hasChromium)('Chromium browser egress policy modes', () => {
       response.end('<!doctype html><title>Proxy target</title>')
     })
     await listen(target)
-    const proxy = new NetworkPolicyProxy(new MappedPolicy({ allowPrivateNetwork: false }))
+    const proxy = new NetworkPolicyProxy(new MappedPolicy({ mode: 'strict' }))
     const settings = await proxy.listen(new AbortController().signal)
     const browser = await chromium.launch({
       headless: true,
       proxy: settings,
-      args: [...chromiumNetworkArgs(false)],
+      args: [...chromiumNetworkArgs('strict')],
     })
     const origin = `http://dsh-proxy.invalid:${portOf(target)}`
     try {
@@ -216,12 +216,12 @@ describe.skipIf(!hasChromium)('Chromium browser egress policy modes', () => {
         return super.resolveWebSocketAllowed(rawUrl)
       }
     }
-    const proxy = new NetworkPolicyProxy(new CountingPolicy({ allowPrivateNetwork: false }))
+    const proxy = new NetworkPolicyProxy(new CountingPolicy({ mode: 'strict' }))
     const settings = await proxy.listen(new AbortController().signal)
     const browser = await chromium.launch({
       headless: true,
       proxy: settings,
-      args: [...chromiumNetworkArgs(false)],
+      args: [...chromiumNetworkArgs('strict')],
     })
     try {
       const page = await browser.newPage()
@@ -254,11 +254,11 @@ describe.skipIf(!hasChromium)('Chromium browser egress policy modes', () => {
   })
 
   it('allows explicit private WebRTC but blocks strict-mode STUN and TURN', { timeout: 20_000 }, async () => {
-    expect(chromiumNetworkArgs(false)).toEqual([
+    expect(chromiumNetworkArgs('strict')).toEqual([
       '--disable-quic',
       '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
     ])
-    expect(chromiumNetworkArgs(true)).toEqual([])
+    expect(chromiumNetworkArgs('unrestricted')).toEqual([])
 
     const allowed = await webRtcProbe(true)
     expect(allowed.udpPackets).toBeGreaterThan(0)
@@ -341,7 +341,7 @@ async function proxyConnect(settings: NetworkProxySettings, authority: string): 
   })
 }
 
-async function webRtcProbe(allowPrivateNetwork: boolean): Promise<{
+async function webRtcProbe(unrestricted: boolean): Promise<{
   udpPackets: number
   tcpConnections: number
 }> {
@@ -358,14 +358,14 @@ async function webRtcProbe(allowPrivateNetwork: boolean): Promise<{
     socket.destroy()
   })
   await listen(tcpServer)
-  const proxy = allowPrivateNetwork
+  const proxy = unrestricted
     ? undefined
-    : new NetworkPolicyProxy(new NetworkPolicy({ allowPrivateNetwork: false }))
+    : new NetworkPolicyProxy(new NetworkPolicy({ mode: 'strict' }))
   const settings = await proxy?.listen(new AbortController().signal)
   const browser = await chromium.launch({
     headless: true,
     ...(settings === undefined ? {} : { proxy: settings }),
-    args: [...chromiumNetworkArgs(allowPrivateNetwork)],
+    args: [...chromiumNetworkArgs(unrestricted ? 'unrestricted' : 'strict')],
   })
   try {
     const page = await browser.newPage()
@@ -402,7 +402,7 @@ async function webRtcProbe(allowPrivateNetwork: boolean): Promise<{
   return { udpPackets, tcpConnections }
 }
 
-async function webTransportProbe(allowPrivateNetwork: boolean): Promise<{
+async function webTransportProbe(unrestricted: boolean): Promise<{
   udpPackets: number
   secureContext: boolean
   webTransport: boolean
@@ -421,14 +421,14 @@ async function webTransportProbe(allowPrivateNetwork: boolean): Promise<{
   })
   await listen(pageServer)
   const origin = `http://127.0.0.1:${portOf(pageServer)}`
-  const proxy = allowPrivateNetwork
+  const proxy = unrestricted
     ? undefined
-    : new NetworkPolicyProxy(new MappedPolicy({ allowPrivateNetwork: false }))
+    : new NetworkPolicyProxy(new MappedPolicy({ mode: 'strict' }))
   const settings = await proxy?.listen(new AbortController().signal)
   const browser = await chromium.launch({
     headless: true,
     ...(settings === undefined ? {} : { proxy: settings }),
-    args: [...chromiumNetworkArgs(allowPrivateNetwork)],
+    args: [...chromiumNetworkArgs(unrestricted ? 'unrestricted' : 'strict')],
   })
   try {
     const page = await browser.newPage()

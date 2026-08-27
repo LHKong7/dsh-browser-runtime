@@ -91,7 +91,9 @@ describe.skipIf(!hasChromium)('observation ranking and extraction in a real brow
     await ctx.plugin(BrowserRuntime, { provider: 'playwright' })
     unregister = ctx.browserRuntime.registerProvider(new PlaywrightBrowserProvider({
       headless: true,
-      allowPrivateNetwork: true,
+      // The allowlist keeps the policy proxy, DNS pinning, and the Chromium
+      // egress restrictions in place while admitting the loopback fixture.
+      network: { mode: 'allowlist', allowCidrs: ['127.0.0.1/32'] },
       maxElements: 200,
     }))
     lease = await ctx.browserRuntime.acquire({
@@ -262,7 +264,7 @@ describe.skipIf(!hasChromium)('interaction tools in a real browser', () => {
     await ctx.plugin(BrowserRuntime, { provider: 'playwright' })
     unregister = ctx.browserRuntime.registerProvider(new PlaywrightBrowserProvider({
       headless: true,
-      allowPrivateNetwork: true,
+      network: { mode: 'allowlist', allowCidrs: ['127.0.0.1/32'] },
     }))
     lease = await ctx.browserRuntime.acquire({
       owner: {},

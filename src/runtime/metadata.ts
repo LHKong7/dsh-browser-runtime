@@ -12,6 +12,8 @@ const checkpointSchema = z.object({
   environmentId: z.string(),
   generation: z.number().int().nonnegative(),
   providerId: z.string(),
+  // Optional so an index written before provider versions were tracked opens.
+  providerVersion: z.string().optional(),
   ref: z.string(),
   coverage: z.array(z.enum(['cookies', 'local-storage'])),
   createdAt: z.string(),

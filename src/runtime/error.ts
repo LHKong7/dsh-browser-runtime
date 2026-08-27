@@ -17,6 +17,7 @@ export type BrowserRuntimeErrorCode =
   | 'BROWSER_PASSWORD_INPUT_FORBIDDEN'
   | 'BROWSER_CHECKPOINT_UNAVAILABLE'
   | 'BROWSER_CHECKPOINT_PROVIDER_MISMATCH'
+  | 'BROWSER_CHECKPOINT_VERSION_MISMATCH'
   | 'BROWSER_INVALID_URL'
   | 'BROWSER_INVALID_ARGUMENT'
   | 'BROWSER_OBSERVATION_SUPERSEDED'
@@ -49,6 +50,14 @@ export class BrowserProviderTargetStaleError extends Error {
   constructor(message = 'the observed browser element changed before the action') {
     super(message)
     this.name = 'BrowserProviderTargetStaleError'
+  }
+}
+
+/** Provider signal that a checkpoint payload no longer exists on disk. */
+export class BrowserProviderCheckpointMissingError extends Error {
+  constructor(message = 'the browser checkpoint payload no longer exists') {
+    super(message)
+    this.name = 'BrowserProviderCheckpointMissingError'
   }
 }
 
@@ -127,6 +136,9 @@ const FAILURE_CLASSIFICATION: Readonly<Record<string, FailureClassification>> = 
   BROWSER_PROVIDER_CONFIGURED_UNAVAILABLE: { observationValid: true, retryable: false },
   BROWSER_PROVIDER_CONFIGURED_MISSING: { observationValid: true, retryable: false },
   BROWSER_PROVIDER_AMBIGUOUS: { observationValid: true, retryable: false },
+  BROWSER_CHECKPOINT_VERSION_MISMATCH: { observationValid: true, retryable: false },
+  BROWSER_CHECKPOINT_PROVIDER_MISMATCH: { observationValid: true, retryable: false },
+  BROWSER_CHECKPOINT_UNAVAILABLE: { observationValid: true, retryable: false },
 }
 
 /**

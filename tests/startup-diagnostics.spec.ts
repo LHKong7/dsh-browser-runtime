@@ -79,7 +79,7 @@ describe('Playwright provider startup reporting', () => {
       'provider=playwright',
       'chromium=available',
       'headless=false',
-      'networkPolicy=allow-private',
+      'networkPolicy=unrestricted',
     ])
     expect(new PlaywrightBrowserProvider({}).startupReport({ playwrightVersion: '1.62.1', installed: false })).toEqual([
       'provider=playwright',
@@ -87,6 +87,31 @@ describe('Playwright provider startup reporting', () => {
       'headless=true',
       'networkPolicy=strict',
     ])
+  })
+
+  it('names what an allowlist admits beyond public unicast', () => {
+    const provider = new PlaywrightBrowserProvider({
+      network: {
+        mode: 'allowlist',
+        allowHosts: ['dev.internal.example'],
+        allowCidrs: ['127.0.0.1/32'],
+        denyCidrs: ['169.254.0.0/16'],
+      },
+    })
+    expect(provider.startupReport({ playwrightVersion: '1.62.1', installed: true })).toEqual([
+      'provider=playwright',
+      'chromium=available',
+      'headless=true',
+      'networkPolicy=allowlist',
+      'networkAllow=dev.internal.example,127.0.0.1/32 deny=169.254.0.0/16',
+    ])
+  })
+
+  it('refuses the deprecated switch alongside a contradicting network mode', () => {
+    expect(() => new PlaywrightBrowserProvider({
+      allowPrivateNetwork: true,
+      network: { mode: 'allowlist' },
+    })).toThrow(/allowPrivateNetwork conflicts with network.mode/)
   })
 
   it('names the missing Chromium build through the runtime error path', () => {

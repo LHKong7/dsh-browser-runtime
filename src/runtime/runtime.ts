@@ -4,7 +4,13 @@ import { createHash, randomUUID } from 'node:crypto'
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
-import { BrowserRuntimeError, BrowserProviderPolicyError, BrowserProviderTargetStaleError, errorEvidence } from './error.ts'
+import {
+  BrowserRuntimeError,
+  BrowserProviderCheckpointMissingError,
+  BrowserProviderPolicyError,
+  BrowserProviderTargetStaleError,
+  errorEvidence,
+} from './error.ts'
 import { browserRuntimeDomainSpec, transitionRecord } from './metadata.ts'
 import type { BrowserTransitionRecord } from './metadata.ts'
 import { SerialExecutor, waitWithSignal } from './serial.ts'
@@ -60,6 +66,10 @@ export interface Config {
   readonly maxTransitionsInMemory?: number
   /** Maximum time allowed for a shutdown checkpoint before provider close proceeds. */
   readonly cleanupTimeoutMs?: number
+  /** Age at which a stored checkpoint is dropped; `0` retains it indefinitely. */
+  readonly checkpointTtlMs?: number
+  /** Maximum stored checkpoints; the oldest beyond this are dropped. */
+  readonly maxCheckpoints?: number
 }
 
 interface ResolvedConfig {
@@ -67,6 +77,8 @@ interface ResolvedConfig {
   readonly maxTextChars: number
   readonly maxTransitionsInMemory: number
   readonly cleanupTimeoutMs: number
+  readonly checkpointTtlMs: number
+  readonly maxCheckpoints: number
 }
 
 interface EnvironmentSlot {
@@ -98,6 +110,8 @@ export const Config: z<Config> = z.object({
   maxTextChars: z.number().default(60_000),
   maxTransitionsInMemory: z.number().default(500),
   cleanupTimeoutMs: z.number().default(10_000),
+  checkpointTtlMs: z.number().default(0),
+  maxCheckpoints: z.number().default(100),
 })
 
 const EMPTY_CAPABILITIES: BrowserProviderCapabilities = {
@@ -135,6 +149,7 @@ export class BrowserRuntime extends Service {
         this.checkpoints.set(sessionId, checkpoint)
       }
       this.metadataDomain = domain
+      await this.pruneCheckpoints()
       storageCtx.effect(() => async () => {
         if (this.metadataDomain === domain) this.metadataDomain = undefined
         await domain.close()
@@ -241,6 +256,49 @@ export class BrowserRuntime extends Service {
     return this.checkpoints.get(sessionId)
   }
 
+  /** Every indexed checkpoint, newest first. */
+  listCheckpoints(): readonly BrowserCheckpointRecord[] {
+    return [...this.checkpoints.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  }
+
+  /**
+   * Drop checkpoints past the configured age or count, oldest first.
+   *
+   * A checkpoint for a live session is never dropped: its environment still
+   * owns the payload. Payload deletion failures are logged rather than thrown,
+   * because the index entry is already gone and retrying it would deadlock the
+   * caller behind a Provider that cannot delete.
+   * @returns the sessions whose checkpoints were removed.
+   */
+  async pruneCheckpoints(): Promise<readonly BrowserSessionId[]> {
+    const live = new Set([...this.slots.values()].map(slot => slot.sessionId))
+    const stored = [...this.checkpoints.values()]
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    const candidates = stored.filter(record => !live.has(record.sessionId))
+    const cutoff = this.config.checkpointTtlMs === 0
+      ? undefined
+      : Date.now() - this.config.checkpointTtlMs
+    const expired = cutoff === undefined
+      ? []
+      : candidates.filter(record => Date.parse(record.createdAt) < cutoff)
+    // A live session's checkpoint counts against the limit but is never the one
+    // dropped: its environment still owns the payload.
+    const overLimit = stored.length - expired.length - this.config.maxCheckpoints
+    const overflow = candidates
+      .filter(record => !expired.includes(record))
+      .slice(0, Math.max(overLimit, 0))
+    const removed: BrowserSessionId[] = []
+    for (const record of [...expired, ...overflow]) {
+      try {
+        await this.destroyCheckpoint(record.sessionId)
+        removed.push(record.sessionId)
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`browser checkpoint prune failed for "${record.sessionId}": ${String(error)}`)
+      }
+    }
+    return removed
+  }
+
   /**
    * Return retained transition metadata for one session in creation order.
    * Durable compact-index rows are merged with the bounded in-memory records.
@@ -281,6 +339,21 @@ export class BrowserRuntime extends Service {
     await requireCheckpointProvider(provider).destroyCheckpoint(checkpoint.ref)
   }
 
+  /** Remove one index entry whose provider payload no longer exists. */
+  private async forgetCheckpoint(
+    sessionId: BrowserSessionId,
+    record: BrowserCheckpointRecord,
+  ): Promise<void> {
+    if (this.checkpoints.get(sessionId) !== record) return
+    this.checkpoints.delete(sessionId)
+    if (this.metadataDomain === undefined) return
+    try {
+      await this.metadataDomain.table('checkpoints').delete(sessionId)
+    } catch (error: unknown) {
+      this.ctx.logger.warn(`browser checkpoint index cleanup failed for "${sessionId}": ${String(error)}`)
+    }
+  }
+
   private async openEnvironment(slot: EnvironmentSlot): Promise<ActiveEnvironment> {
     const signal = slot.opening.signal
     signal.throwIfAborted()
@@ -296,17 +369,44 @@ export class BrowserRuntime extends Service {
       )
     }
 
-    const generation = checkpoint === undefined ? 1 : checkpoint.generation + 1
+    if (checkpoint !== undefined
+      && provider.version !== undefined
+      && checkpoint.providerVersion !== undefined
+      && checkpoint.providerVersion !== provider.version) {
+      throw new BrowserRuntimeError(
+        `checkpoint for session "${slot.sessionId}" was written by browser provider "${provider.id}" `
+        + `version ${checkpoint.providerVersion}, not the running ${provider.version}; `
+        + 'destroy the checkpoint to start a fresh environment',
+        'BROWSER_CHECKPOINT_VERSION_MISMATCH',
+      )
+    }
+
+    let restored = checkpoint
+    const generation = restored === undefined ? 1 : restored.generation + 1
     let backend: BrowserProviderEnvironment
-    if (checkpoint === undefined) {
+    if (restored === undefined) {
       backend = await provider.open({ environmentId: slot.environmentId, sessionId: slot.sessionId, signal })
     } else {
-      backend = await requireCheckpointProvider(provider).restore({
-        environmentId: slot.environmentId,
-        sessionId: slot.sessionId,
-        signal,
-        checkpoint,
-      })
+      try {
+        backend = await requireCheckpointProvider(provider).restore({
+          environmentId: slot.environmentId,
+          sessionId: slot.sessionId,
+          signal,
+          checkpoint: restored,
+        })
+      } catch (error: unknown) {
+        // A payload cleared out of band leaves an index entry pointing at
+        // nothing. Dropping the entry and opening fresh beats failing every
+        // acquire for a session whose stored state no longer exists.
+        if (!(error instanceof BrowserProviderCheckpointMissingError)) throw error
+        this.ctx.logger.warn(
+          `browser checkpoint payload for session "${slot.sessionId}" is gone; opening a fresh environment`,
+        )
+        await this.forgetCheckpoint(slot.sessionId, restored)
+        restored = undefined
+        signal.throwIfAborted()
+        backend = await provider.open({ environmentId: slot.environmentId, sessionId: slot.sessionId, signal })
+      }
     }
     if (provider.capabilities.checkpoint && backend.checkpoint === undefined) {
       const capabilityFailure = new BrowserRuntimeError(
@@ -327,7 +427,7 @@ export class BrowserRuntime extends Service {
       await backend.close()
       throw new BrowserRuntimeError('browser environment is closing', 'BROWSER_ENVIRONMENT_CLOSED')
     }
-    return new ActiveEnvironment(this, slot, provider, backend, generation)
+    return new ActiveEnvironment(this, slot, provider, backend, restored === undefined ? 1 : generation)
   }
 
   private async resolveProvider(
@@ -503,6 +603,7 @@ export class BrowserRuntime extends Service {
         environmentId: slot.environmentId,
         generation,
         providerId: provider.id,
+        ...(provider.version === undefined ? {} : { providerVersion: provider.version }),
         ref: BrowserCheckpointRef(payload.ref),
         coverage: [...payload.coverage],
         createdAt: new Date().toISOString(),
@@ -981,14 +1082,26 @@ function resolveConfig(config: Config): ResolvedConfig {
   const maxTextChars = config.maxTextChars ?? 60_000
   const maxTransitionsInMemory = config.maxTransitionsInMemory ?? 500
   const cleanupTimeoutMs = config.cleanupTimeoutMs ?? 10_000
-  for (const [key, value] of Object.entries({ maxTextChars, maxTransitionsInMemory, cleanupTimeoutMs })) {
+  const maxCheckpoints = config.maxCheckpoints ?? 100
+  const checkpointTtlMs = config.checkpointTtlMs ?? 0
+  for (const [key, value] of Object.entries({
+    maxTextChars,
+    maxTransitionsInMemory,
+    cleanupTimeoutMs,
+    maxCheckpoints,
+  })) {
     if (!Number.isInteger(value) || value < 1) throw new Error(`browser-runtime: ${key} must be a positive integer`)
+  }
+  if (!Number.isInteger(checkpointTtlMs) || checkpointTtlMs < 0) {
+    throw new Error('browser-runtime: checkpointTtlMs must be a non-negative integer')
   }
   return {
     ...(config.provider === undefined ? {} : { provider: BrowserProviderId(config.provider) }),
     maxTextChars,
     maxTransitionsInMemory,
     cleanupTimeoutMs,
+    checkpointTtlMs,
+    maxCheckpoints,
   }
 }
 
