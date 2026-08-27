@@ -6,6 +6,8 @@
         maxTextChars: 60000
         maxTransitionsInMemory: 500
         cleanupTimeoutMs: 10000
+        checkpointTtlMs: 0
+        maxCheckpoints: 100
 
     - id: browser-playwright
       name: dsh-browser-runtime/playwright
@@ -14,7 +16,11 @@
         navigationTimeoutMs: 30000
         actionTimeoutMs: 10000
         maxElements: 100
-        allowPrivateNetwork: false
+        network:
+          mode: strict
+          allowHosts: []
+          allowCidrs: []
+          denyCidrs: []
 
     - id: tool-browser
       name: dsh-browser-runtime/tools
@@ -22,3 +28,6 @@
         provider: playwright
         persistence: ephemeral
         timeoutMs: 30000
+        observeMode: summary
+        maxTextChars: 12000
+        maxElements: 100

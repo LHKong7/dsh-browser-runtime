@@ -100,14 +100,27 @@ function call(name: string, arguments_: unknown, signal = new AbortController().
 }
 
 describe('browser tools through the real ToolRuntime', () => {
-  it('registers the five selector-free schemas', () => {
+  it('registers selector-free schemas for the whole suite', () => {
     const schemas = new Map(ctx.tools.schemas().map(schema => [schema.name, schema]))
     expect([...schemas.keys()].filter(name => name.startsWith('browser_')).sort()).toEqual([
+      'browser_back',
+      'browser_check',
       'browser_click',
+      'browser_extract_article',
+      'browser_extract_links',
+      'browser_extract_list',
+      'browser_extract_table',
       'browser_fill',
+      'browser_forward',
       'browser_observe',
+      'browser_observe_next',
       'browser_open',
+      'browser_press',
+      'browser_reload',
       'browser_screenshot',
+      'browser_scroll',
+      'browser_select',
+      'browser_wait',
     ])
     for (const schema of schemas.values()) {
       if (!schema.name.startsWith('browser_')) continue

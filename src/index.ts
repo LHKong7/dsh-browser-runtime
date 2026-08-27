@@ -1,11 +1,21 @@
 /** Browser environment Service Definition and provider-neutral runtime. @module dsh-browser-runtime */
 
-export { BrowserRuntimeError, BrowserProviderPolicyError, BrowserProviderTargetStaleError } from './runtime/error.ts'
-export type { BrowserRuntimeErrorCode } from './runtime/error.ts'
+export {
+  BrowserRuntimeError,
+  BrowserProviderCheckpointMissingError,
+  BrowserProviderPolicyError,
+  BrowserProviderTargetStaleError,
+  browserFailureLine,
+  classifyBrowserFailure,
+} from './runtime/error.ts'
+export type { BrowserFailureEvidence, BrowserRuntimeErrorCode } from './runtime/error.ts'
 export { browserRuntimeDomainSpec } from './runtime/metadata.ts'
 export type { BrowserTransitionRecord } from './runtime/metadata.ts'
 export {
+  BROWSER_EXTRACTION_FIELDS,
+  BROWSER_KEYS,
   BrowserCheckpointRef,
+  BrowserElementGroupRef,
   BrowserElementRef,
   BrowserEnvironmentId,
   BrowserObservationId,
@@ -18,25 +28,39 @@ export type {
   BrowserAcquireRequest,
   BrowserAction,
   BrowserCapability,
+  BrowserCheckAction,
   BrowserCheckpointCoverage,
   BrowserCheckpointRecord,
   BrowserClickAction,
+  BrowserCredentialFillAction,
   BrowserElement,
+  BrowserElementGroup,
+  BrowserElementGroupRef as BrowserElementGroupRefType,
   BrowserElementRef as BrowserElementRefType,
+  BrowserElementSection,
   BrowserEnvironmentId as BrowserEnvironmentIdType,
   BrowserEnvironmentLease,
+  BrowserExtraction,
+  BrowserExtractionKind,
+  BrowserExtractionRow,
+  BrowserExtractRequest,
   BrowserFillAction,
+  BrowserHistoryAction,
+  BrowserKey,
   BrowserNavigateAction,
   BrowserObservation,
   BrowserObservationId as BrowserObservationIdType,
+  BrowserObserveOptions,
   BrowserPageId as BrowserPageIdType,
   BrowserPersistence,
+  BrowserPressAction,
   BrowserProvider,
   BrowserProviderAction,
   BrowserProviderCapabilities,
   BrowserProviderCheckpoint,
   BrowserProviderElement,
   BrowserProviderEnvironment,
+  BrowserProviderExtractRequest,
   BrowserProviderId as BrowserProviderIdType,
   BrowserProviderInfo,
   BrowserProviderObservation,
@@ -45,12 +69,19 @@ export type {
   BrowserProviderRestoreRequest,
   BrowserProviderTarget,
   BrowserRecordedAction,
+  BrowserReloadAction,
   BrowserScreenshot,
   BrowserScreenshotOptions,
+  BrowserScrollAction,
+  BrowserScrollTarget,
+  BrowserSelectAction,
   BrowserSessionId as BrowserSessionIdType,
   BrowserTransition,
   BrowserTransitionId as BrowserTransitionIdType,
+  BrowserTransitionMetrics,
   BrowserTransitionOutcome,
+  BrowserWaitAction,
+  BrowserWaitCondition,
 } from './runtime/types.ts'
 export { BrowserRuntime, Config, EMPTY_CAPABILITIES, name } from './runtime/runtime.ts'
 export type { Config as BrowserRuntimeConfig } from './runtime/runtime.ts'

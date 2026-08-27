@@ -1,7 +1,9 @@
 /** Playwright provider plugin entrypoint. @module dsh-browser-runtime/playwright */
 
-export { NetworkPolicy, isPublicAddress } from './provider/network-policy.ts'
-export type { NetworkPolicyConfig } from './provider/network-policy.ts'
+export { NetworkPolicy, isPublicAddress, usesPolicyProxy } from './provider/network-policy.ts'
+export type { NetworkPolicyConfig, NetworkPolicyMode } from './provider/network-policy.ts'
+export { chromiumMissingMessage, readChromiumInstallation } from './provider/chromium.ts'
+export type { ChromiumInstallation } from './provider/chromium.ts'
 export {
   Config,
   PLAYWRIGHT_PROVIDER_ID,
@@ -10,5 +12,7 @@ export {
   inject,
   name,
 } from './provider/playwright.ts'
-export type { Config as PlaywrightBrowserConfig } from './provider/playwright.ts'
-export { default } from './provider/playwright.ts'
+export type {
+  Config as PlaywrightBrowserConfig,
+  NetworkPolicyConfigInput,
+} from './provider/playwright.ts'

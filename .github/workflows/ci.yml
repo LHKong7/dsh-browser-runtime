@@ -17,9 +17,13 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
+      - run: node lib/cli/index.js install chromium --with-deps
       - run: pnpm run typecheck
       - run: pnpm run test:coverage
       - run: pnpm run build
       - run: pnpm run lint:package
-      - run: pnpm pack
+      # Verifies the built tree, then packs, extracts, and re-verifies the exact
+      # tarball a profile installs: entry export shapes through the real Loader,
+      # a real Cordis mount, `doctor`, and the build identity report.
+      - run: pnpm run verify:package
+      - run: pnpm run verify:tarball

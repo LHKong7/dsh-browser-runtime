@@ -1,6 +1,9 @@
 # Agent Note: Enforce policy across browser egress
 
-Status: implemented
+Status: implemented; the `allowPrivateNetwork` decision is superseded by
+[Make private-network access an allowlist, not a switch](2026-08-27-network-allowlist.md),
+which keeps every control described here and replaces the boolean with
+`network.mode` plus host, allow, and deny lists.
 
 English | [中文](2026-08-27-browser-egress-policy.zh.md)
 

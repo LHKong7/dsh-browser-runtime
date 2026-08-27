@@ -1,7 +1,6 @@
 /** Isolated Playwright/Chromium provider with bounded observations and storage-state checkpoints. */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
 import { chmod, lstat, mkdtemp, mkdir, readFile, rm, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
@@ -10,6 +9,7 @@ import z from '@deepseek-ai/schemastery'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { chromium } from 'playwright'
+import type { ElementSnapshot } from './page-snapshot.ts'
 import type {
   Browser,
   BrowserContext,
@@ -24,22 +24,43 @@ import type {
   Response,
 } from 'playwright'
 import { z as zod } from 'zod'
-import { BrowserProviderPolicyError, BrowserProviderTargetStaleError } from '../runtime/error.ts'
+import {
+  BrowserProviderCheckpointMissingError,
+  BrowserProviderPolicyError,
+  BrowserProviderTargetStaleError,
+} from '../runtime/error.ts'
 import { BrowserCheckpointRef, BrowserPageId, BrowserProviderId } from '../runtime/types.ts'
 import type {
+  BrowserExtraction,
   BrowserProvider,
   BrowserProviderAction,
   BrowserProviderCheckpoint,
   BrowserProviderElement,
   BrowserProviderEnvironment,
+  BrowserProviderExtractRequest,
   BrowserProviderObservation,
+  BrowserProviderObserveRequest,
   BrowserProviderOpenRequest,
   BrowserProviderRestoreRequest,
   BrowserProviderTarget,
   BrowserCheckpointRef as BrowserCheckpointRefType,
 } from '../runtime/types.ts'
 import type {} from '../runtime/runtime.ts'
-import { NetworkPolicy, routeWebSocketWithNetworkPolicy, routeWithNetworkPolicy } from './network-policy.ts'
+import { chromiumMissingMessage, defaultCheckpointRoot, readChromiumInstallation } from './chromium.ts'
+import {
+  extractStructuredContent,
+  scrollViewport,
+  snapshotBodyText,
+  snapshotElements,
+  snapshotScreenshotLayout,
+} from './page-snapshot.ts'
+import {
+  NetworkPolicy,
+  routeWebSocketWithNetworkPolicy,
+  routeWithNetworkPolicy,
+  usesPolicyProxy,
+} from './network-policy.ts'
+import type { NetworkPolicyConfig, NetworkPolicyMode } from './network-policy.ts'
 import {
   chromiumNetworkArgs,
   NETWORK_PROXY_AUTHENTICATION_URL,
@@ -67,10 +88,28 @@ export interface Config {
   readonly maxScreenshotPixels?: number
   /** Maximum encoded PNG bytes returned by one screenshot. */
   readonly maxScreenshotBytes?: number
-  /** Permit loopback, link-local, and private network destinations. */
+  /**
+   * Egress policy. `strict` admits only public unicast destinations;
+   * `allowlist` adds named hosts and CIDRs while keeping the policy proxy, DNS
+   * pinning, and the Chromium egress restrictions; `unrestricted` removes them.
+   */
+  readonly network?: NetworkPolicyConfigInput
+  /**
+   * Deprecated coarse switch retained for existing profiles. `true` is
+   * equivalent to `network.mode: unrestricted`; prefer the allowlist.
+   * @deprecated use `network` instead.
+   */
   readonly allowPrivateNetwork?: boolean
   /** Provider-private checkpoint directory. */
   readonly checkpointRoot?: string
+}
+
+/** Egress policy as a profile writes it. */
+export interface NetworkPolicyConfigInput {
+  readonly mode?: NetworkPolicyMode
+  readonly allowHosts?: string[]
+  readonly allowCidrs?: string[]
+  readonly denyCidrs?: string[]
 }
 
 interface ResolvedConfig {
@@ -80,20 +119,8 @@ interface ResolvedConfig {
   readonly maxElements: number
   readonly maxScreenshotPixels: number
   readonly maxScreenshotBytes: number
-  readonly allowPrivateNetwork: boolean
+  readonly network: NetworkPolicyConfig
   readonly checkpointRoot: string
-}
-
-interface ElementSnapshot {
-  readonly ordinal: number
-  readonly kind: string
-  readonly name: string
-  readonly disabled: boolean
-  readonly opensNewPage: boolean
-  readonly downloads: boolean
-  readonly externalProtocol: boolean
-  readonly inputType?: string
-  readonly fingerprint: string
 }
 
 interface PlaywrightTarget {
@@ -153,6 +180,12 @@ export const Config: z<Config> = z.object({
   maxElements: z.number().default(100),
   maxScreenshotPixels: z.number().default(16_000_000),
   maxScreenshotBytes: z.number().default(16 * 1024 * 1024),
+  network: z.object({
+    mode: z.union(['strict', 'allowlist', 'unrestricted'] as const).default('strict'),
+    allowHosts: z.array(z.string()).default([]),
+    allowCidrs: z.array(z.string()).default([]),
+    denyCidrs: z.array(z.string()).default([]),
+  }),
   allowPrivateNetwork: z.boolean().default(false),
   checkpointRoot: z.string(),
 })
@@ -160,9 +193,15 @@ export const Config: z<Config> = z.object({
 /** Playwright implementation of the BrowserProvider interface. */
 export class PlaywrightBrowserProvider implements BrowserProvider {
   readonly id = PLAYWRIGHT_PROVIDER_ID
+  /**
+   * The pinned Playwright version. Checkpoint payloads are Playwright storage
+   * state, so a payload written by another build is not this build's to read.
+   */
+  readonly version = readChromiumInstallation().playwrightVersion
   readonly capabilities = {
     checkpoint: true,
     screenshot: true,
+    extraction: true,
     multiplePages: false,
     attachExisting: false,
     persistentProfile: false,
@@ -176,7 +215,30 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
 
   /** Return true when Playwright's managed Chromium executable exists. */
   available(): boolean {
-    return existsSync(chromium.executablePath())
+    return readChromiumInstallation().installed
+  }
+
+  /** Name the missing Chromium build and the command that installs it. */
+  unavailableReason(): string | undefined {
+    const installation = readChromiumInstallation()
+    return installation.installed ? undefined : chromiumMissingMessage(installation)
+  }
+
+  /**
+   * Summarize the launch configuration for the plugin start log.
+   * @param installation - the Chromium installation state to report.
+   * @returns one `key=value` line per fact, in report order.
+   */
+  startupReport(installation = readChromiumInstallation()): readonly string[] {
+    return [
+      `provider=${this.id}`,
+      `chromium=${installation.installed ? 'available' : 'missing'}`,
+      `headless=${this.config.headless}`,
+      `networkPolicy=${this.config.network.mode}`,
+      ...(this.config.network.mode === 'allowlist'
+        ? [`networkAllow=${describeAllowance(this.config.network)}`]
+        : []),
+    ]
   }
 
   /** Open a fresh isolated browser context. */
@@ -211,14 +273,14 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
     let context: BrowserContext | undefined
     let networkProxy: NetworkPolicyProxy | undefined
     try {
-      const policy = new NetworkPolicy({ allowPrivateNetwork: this.config.allowPrivateNetwork })
-      if (!this.config.allowPrivateNetwork) networkProxy = new NetworkPolicyProxy(policy)
+      const policy = new NetworkPolicy(this.config.network)
+      if (usesPolicyProxy(policy.mode)) networkProxy = new NetworkPolicyProxy(policy)
       const proxy = await networkProxy?.listen(request.signal)
       browser = await chromium.launch({
         headless: this.config.headless,
         env: chromiumEnvironment(controlHome),
         ...(proxy === undefined ? {} : { proxy }),
-        args: ['--deny-permission-prompts', ...chromiumNetworkArgs(this.config.allowPrivateNetwork)],
+        args: ['--deny-permission-prompts', ...chromiumNetworkArgs(this.config.network.mode)],
       })
       request.signal.throwIfAborted()
       context = await browser.newContext({
@@ -254,7 +316,15 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
   }
 
   private async readCheckpoint(ref: BrowserCheckpointRefType): Promise<BrowserContextOptions['storageState']> {
-    const raw = await readFile(this.checkpointPath(ref), 'utf8')
+    let raw: string
+    try {
+      raw = await readFile(this.checkpointPath(ref), 'utf8')
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === 'ENOENT') {
+        throw new BrowserProviderCheckpointMissingError(`Playwright checkpoint payload ${ref} no longer exists`)
+      }
+      throw error
+    }
     return checkpointStateSchema.parse(JSON.parse(raw))
   }
 
@@ -537,14 +607,17 @@ class PlaywrightEnvironment implements BrowserProviderEnvironment {
     signal.throwIfAborted()
   }
 
-  async observe(request: { maxTextChars: number; signal: AbortSignal }): Promise<BrowserProviderObservation> {
+  async observe(request: BrowserProviderObserveRequest): Promise<BrowserProviderObservation> {
     return this.run(request.signal, async () => {
       const page = this.requirePage()
-      const [title, body, elements] = await Promise.all([
+      const maxElements = request.maxElements === undefined
+        ? this.config.maxElements
+        : Math.min(Math.max(Math.trunc(request.maxElements), 0), this.config.maxElements)
+      const [title, body, snapshot] = await Promise.all([
         page.title(),
         page.locator('body').evaluate(snapshotBodyText, request.maxTextChars)
-          .catch(() => ({ text: '', truncated: false })),
-        page.locator(INTERACTIVE_SELECTOR).evaluateAll(snapshotElements, this.config.maxElements),
+          .catch(() => ({ text: '', truncated: false, totalChars: 0 })),
+        page.locator(INTERACTIVE_SELECTOR).evaluateAll(snapshotElements, maxElements),
       ])
       return {
         pageId: BrowserPageId('page-1'),
@@ -552,17 +625,25 @@ class PlaywrightEnvironment implements BrowserProviderEnvironment {
         title,
         text: body.text,
         truncated: body.truncated,
-        elements: elements.map((element): BrowserProviderElement => ({
+        totalTextChars: body.totalChars,
+        elements: snapshot.elements.map((element): BrowserProviderElement => ({
           kind: element.kind,
           name: element.name,
           disabled: element.disabled,
           ...(element.inputType === undefined ? {} : { inputType: element.inputType }),
+          section: element.section,
+          priority: element.priority,
+          pagination: element.pagination,
+          ...(element.groupKey === undefined ? {} : { groupKey: element.groupKey }),
+          ...(element.groupLabel === undefined ? {} : { groupLabel: element.groupLabel }),
           fingerprint: element.fingerprint,
           target: {
             ordinal: element.ordinal,
             opensNewPage: element.opensNewPage,
           } satisfies PlaywrightTarget,
         })),
+        elementsTruncated: snapshot.total > snapshot.elements.length,
+        totalElements: snapshot.total,
       }
     })
   }
@@ -579,29 +660,7 @@ class PlaywrightEnvironment implements BrowserProviderEnvironment {
       this.blockedNavigation = undefined
       let actionFailure: unknown
       try {
-        if (action.type === 'navigate') {
-          await this.policy.assertAllowed(action.url)
-          await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: this.config.navigationTimeoutMs })
-        } else {
-          const target = await this.resolveTarget(action.target)
-          if (target.inputType === 'file') {
-            throw new BrowserProviderPolicyError(FILE_CHOOSER_POLICY_MESSAGE)
-          }
-          if (action.type === 'click') {
-            if (target.externalProtocol) {
-              throw new BrowserProviderPolicyError(EXTERNAL_PROTOCOL_POLICY_MESSAGE)
-            }
-            if (target.opensNewPage) {
-              throw new BrowserProviderPolicyError(NEW_PAGE_POLICY_MESSAGE)
-            }
-            if (target.downloads) {
-              throw new BrowserProviderPolicyError(DOWNLOAD_POLICY_MESSAGE)
-            }
-            await target.locator.click({ timeout: this.config.actionTimeoutMs })
-          } else {
-            await target.locator.fill(action.value, { timeout: this.config.actionTimeoutMs })
-          }
-        }
+        await this.dispatch(page, action)
       } catch (error: unknown) {
         actionFailure = error
       }
@@ -645,6 +704,126 @@ class PlaywrightEnvironment implements BrowserProviderEnvironment {
       }
       if (primaryFailure !== undefined) throw primaryFailure
       if (resourceCleanupFailure !== undefined) throw resourceCleanupFailure
+    })
+  }
+
+  /**
+   * Run one resolved Provider action against the single owned Page.
+   *
+   * Every element-addressed action revalidates its opaque target first, so a
+   * page that changed since the observation fails as stale rather than acting
+   * on a different element.
+   */
+  private async dispatch(page: Page, action: BrowserProviderAction): Promise<void> {
+    switch (action.type) {
+      case 'navigate': {
+        await this.policy.assertAllowed(action.url)
+        await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: this.config.navigationTimeoutMs })
+        return
+      }
+      case 'history': {
+        const moved = action.direction === 'back'
+          ? await page.goBack({ waitUntil: 'domcontentloaded', timeout: this.config.navigationTimeoutMs })
+          : await page.goForward({ waitUntil: 'domcontentloaded', timeout: this.config.navigationTimeoutMs })
+        if (moved === null) {
+          throw new BrowserProviderPolicyError(
+            `browser has no ${action.direction} entry in this environment's session history`,
+          )
+        }
+        return
+      }
+      case 'reload': {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: this.config.navigationTimeoutMs })
+        return
+      }
+      case 'scroll': {
+        if (action.to === 'element') {
+          const target = await this.resolveTarget(requireTarget(action.target))
+          await target.locator.scrollIntoViewIfNeeded({ timeout: this.config.actionTimeoutMs })
+          return
+        }
+        await page.evaluate(scrollViewport, { to: action.to, pages: action.pages })
+        return
+      }
+      case 'wait': {
+        const timeout = Math.min(action.timeoutMs ?? this.config.actionTimeoutMs, this.config.navigationTimeoutMs)
+        if (action.until === 'load') {
+          await page.waitForLoadState('load', { timeout })
+          return
+        }
+        if (action.until === 'network-idle') {
+          await page.waitForLoadState('networkidle', { timeout })
+          return
+        }
+        const target = await this.resolveTarget(requireTarget(action.target))
+        await target.locator.waitFor({
+          state: action.until === 'element-visible' ? 'visible' : 'hidden',
+          timeout,
+        })
+        return
+      }
+      case 'press': {
+        if (action.target === undefined) {
+          await page.keyboard.press(action.key)
+          return
+        }
+        const target = await this.assertActionable(action.target)
+        await target.locator.press(action.key, { timeout: this.config.actionTimeoutMs })
+        return
+      }
+      case 'click': {
+        const target = await this.assertActionable(action.target)
+        if (target.externalProtocol) throw new BrowserProviderPolicyError(EXTERNAL_PROTOCOL_POLICY_MESSAGE)
+        if (target.opensNewPage) throw new BrowserProviderPolicyError(NEW_PAGE_POLICY_MESSAGE)
+        if (target.downloads) throw new BrowserProviderPolicyError(DOWNLOAD_POLICY_MESSAGE)
+        await target.locator.click({ timeout: this.config.actionTimeoutMs })
+        return
+      }
+      case 'fill': {
+        const target = await this.assertActionable(action.target)
+        await target.locator.fill(action.value, { timeout: this.config.actionTimeoutMs })
+        return
+      }
+      case 'select': {
+        const target = await this.assertActionable(action.target)
+        await target.locator.selectOption([...action.values], { timeout: this.config.actionTimeoutMs })
+        return
+      }
+      case 'check': {
+        const target = await this.assertActionable(action.target)
+        if (action.checked) await target.locator.check({ timeout: this.config.actionTimeoutMs })
+        else await target.locator.uncheck({ timeout: this.config.actionTimeoutMs })
+        return
+      }
+    }
+  }
+
+  /** Revalidate one opaque target and reject the element kinds policy forbids. */
+  private async assertActionable(target: BrowserProviderTarget): Promise<ResolvedPlaywrightTarget> {
+    const resolved = await this.resolveTarget(target)
+    if (resolved.inputType === 'file') throw new BrowserProviderPolicyError(FILE_CHOOSER_POLICY_MESSAGE)
+    return resolved
+  }
+
+  async extract(request: BrowserProviderExtractRequest): Promise<BrowserExtraction> {
+    return this.run(request.signal, async () => {
+      const page = this.requirePage()
+      const scope = request.region === undefined
+        ? page.locator('body')
+        : (await this.resolveTarget(request.region)).locator
+      const result = await scope.evaluate(extractStructuredContent, {
+        kind: request.kind,
+        limit: request.limit,
+        maxTextChars: request.maxTextChars,
+      })
+      return {
+        kind: request.kind,
+        url: page.url(),
+        columns: result.columns,
+        rows: result.rows,
+        total: result.total,
+        truncated: result.total > result.rows.length,
+      }
     })
   }
 
@@ -702,7 +881,7 @@ class PlaywrightEnvironment implements BrowserProviderEnvironment {
     const locator = this.requirePage().locator(INTERACTIVE_SELECTOR).nth(target.target.ordinal)
     let snapshot: ElementSnapshot | undefined
     try {
-      snapshot = (await locator.evaluateAll(snapshotElements, 1))[0]
+      snapshot = (await locator.evaluateAll(snapshotElements, 1)).elements[0]
     } catch (error: unknown) {
       throw new BrowserProviderTargetStaleError(`the observed element is no longer present: ${String(error)}`)
     }
@@ -991,16 +1170,48 @@ function resolveConfig(config: Config): ResolvedConfig {
     maxElements,
     maxScreenshotPixels,
     maxScreenshotBytes,
-    allowPrivateNetwork: config.allowPrivateNetwork ?? false,
-    checkpointRoot: resolve(config.checkpointRoot ?? join(
-      resolveDshHome(),
-      'browser-runtime',
-      'providers',
-      'playwright',
-      'v1',
-      'checkpoints',
-    )),
+    network: resolveNetworkConfig(config),
+    checkpointRoot: resolve(config.checkpointRoot ?? defaultCheckpointRoot(resolveDshHome())),
   }
+}
+
+/**
+ * Fold the deprecated `allowPrivateNetwork` switch into the egress policy.
+ *
+ * The old switch is coarse: it removed the policy proxy and every Chromium
+ * egress restriction to reach one private host. It still maps to
+ * `unrestricted` so existing profiles keep working, but combining it with an
+ * explicit mode is a contradiction rather than a merge.
+ */
+function resolveNetworkConfig(config: Config): NetworkPolicyConfig {
+  const requested = config.network
+  if (config.allowPrivateNetwork === true) {
+    if (requested?.mode !== undefined && requested.mode !== 'unrestricted') {
+      throw new Error(
+        `browser-playwright: allowPrivateNetwork conflicts with network.mode "${requested.mode}"; set only network`,
+      )
+    }
+    return {
+      mode: 'unrestricted',
+      allowHosts: requested?.allowHosts ?? [],
+      allowCidrs: requested?.allowCidrs ?? [],
+      denyCidrs: requested?.denyCidrs ?? [],
+    }
+  }
+  return {
+    mode: requested?.mode ?? 'strict',
+    allowHosts: requested?.allowHosts ?? [],
+    allowCidrs: requested?.allowCidrs ?? [],
+    denyCidrs: requested?.denyCidrs ?? [],
+  }
+}
+
+/** One-line summary of what an allowlist admits beyond public unicast. */
+function describeAllowance(network: NetworkPolicyConfig): string {
+  const entries = [...(network.allowHosts ?? []), ...(network.allowCidrs ?? [])]
+  const denied = network.denyCidrs ?? []
+  const allowed = entries.length === 0 ? 'none' : entries.join(',')
+  return denied.length === 0 ? allowed : `${allowed} deny=${denied.join(',')}`
 }
 
 function chromiumEnvironment(controlHome: string): Record<string, string> {
@@ -1030,126 +1241,10 @@ async function removeControlHome(directory: string): Promise<void> {
   await rm(resolved, { recursive: true, force: true })
 }
 
-// Playwright serializes this function into Chromium, outside Node's coverage isolate.
-/* v8 ignore next */
-function snapshotBodyText(body: Element, maxTextChars: number): { text: string; truncated: boolean } {
-  const text = body instanceof HTMLElement ? body.innerText : (body.textContent ?? '')
-  return {
-    text: text.slice(0, maxTextChars),
-    truncated: text.length > maxTextChars,
-  }
-}
-
-// Playwright serializes this function into Chromium, outside Node's coverage isolate.
-/* v8 ignore next */
-function snapshotScreenshotLayout(): {
-  contentWidth: number
-  contentHeight: number
-  viewportWidth: number
-  viewportHeight: number
-  deviceScaleFactor: number
-} {
-  const root = document.documentElement
-  const body = document.body
-  const viewportWidth = Math.max(globalThis.innerWidth, 1)
-  const viewportHeight = Math.max(globalThis.innerHeight, 1)
-  return {
-    contentWidth: Math.max(viewportWidth, root?.scrollWidth ?? 0, body?.scrollWidth ?? 0),
-    contentHeight: Math.max(viewportHeight, root?.scrollHeight ?? 0, body?.scrollHeight ?? 0),
-    viewportWidth,
-    viewportHeight,
-    deviceScaleFactor: Number.isFinite(globalThis.devicePixelRatio) && globalThis.devicePixelRatio > 0
-      ? globalThis.devicePixelRatio
-      : 1,
-  }
-}
-
-// Playwright serializes this function into Chromium, outside Node's coverage isolate.
-/* v8 ignore next */
-function snapshotElements(nodes: Element[], maxElements: number): ElementSnapshot[] {
-  const opensNewPage = (node: HTMLElement): boolean => {
-    const defaultTarget = node.ownerDocument.querySelector('base[target]')?.getAttribute('target') ?? ''
-    let target = ''
-    if (node instanceof HTMLAnchorElement) {
-      target = node.target || defaultTarget
-    } else if (node instanceof HTMLButtonElement && node.type === 'submit') {
-      target = node.formTarget || node.form?.target || defaultTarget
-    } else if (node instanceof HTMLInputElement && (node.type === 'submit' || node.type === 'image')) {
-      target = node.formTarget || node.form?.target || defaultTarget
-    }
-    const trimmed = target.trim()
-    const normalized = trimmed.toLowerCase()
-    if (normalized === '' || normalized === '_self' || normalized === '_parent'
-      || normalized === '_top' || normalized === '_unfencedtop') return false
-    if (normalized === '_blank') return true
-    return ![...node.ownerDocument.querySelectorAll('iframe, frame')]
-      .some(frame => frame.getAttribute('name') === trimmed)
-  }
-  const usesExternalProtocol = (node: HTMLElement): boolean => {
-    let rawUrl: string | null = null
-    if (node instanceof HTMLAnchorElement) {
-      rawUrl = node.getAttribute('href')
-    } else if (node instanceof HTMLButtonElement && node.type === 'submit') {
-      rawUrl = node.getAttribute('formaction') ?? node.form?.getAttribute('action') ?? null
-    } else if (node instanceof HTMLInputElement && (node.type === 'submit' || node.type === 'image')) {
-      rawUrl = node.getAttribute('formaction') ?? node.form?.getAttribute('action') ?? null
-    }
-    if (rawUrl === null) return false
-    try {
-      return !['http:', 'https:', 'javascript:', 'blob:', 'data:', 'about:']
-        .includes(new URL(rawUrl, node.ownerDocument.baseURI).protocol.toLowerCase())
-    } catch {
-      return true
-    }
-  }
-  const describe = (node: HTMLElement, ordinal: number): ElementSnapshot => {
-    const tag = node.tagName.toLowerCase()
-    const role = node.getAttribute('role')?.trim().toLowerCase()
-    const inputType = node instanceof HTMLInputElement ? (node.type || 'text').toLowerCase() : undefined
-    const kind = role || (inputType === undefined ? tag : `${tag}:${inputType}`)
-    const candidate = node.getAttribute('aria-label')
-      ?? node.getAttribute('title')
-      ?? node.getAttribute('alt')
-      ?? node.getAttribute('placeholder')
-      ?? node.textContent
-      ?? ''
-    const name = candidate.replace(/\s+/g, ' ').trim().slice(0, 200)
-    const disabled = 'disabled' in node && Boolean((node as HTMLButtonElement).disabled)
-    const newPage = opensNewPage(node)
-    const downloads = node instanceof HTMLAnchorElement && node.hasAttribute('download')
-    const externalProtocol = usesExternalProtocol(node)
-    const fingerprint = JSON.stringify({
-      tag,
-      role: role ?? '',
-      inputType: inputType ?? '',
-      name,
-      opensNewPage: newPage,
-      downloads,
-      externalProtocol,
-    })
-    return {
-      ordinal,
-      kind,
-      name,
-      disabled,
-      opensNewPage: newPage,
-      downloads,
-      externalProtocol,
-      ...(inputType === undefined ? {} : { inputType }),
-      fingerprint,
-    }
-  }
-  const result: ElementSnapshot[] = []
-  for (let ordinal = 0; ordinal < nodes.length && result.length < maxElements; ordinal += 1) {
-    const node = nodes[ordinal]
-    if (!(node instanceof HTMLElement)) continue
-    const style = getComputedStyle(node)
-    const rect = node.getBoundingClientRect()
-    if (style.visibility === 'hidden' || style.display === 'none' || rect.width === 0 || rect.height === 0) continue
-    const snapshot = describe(node, ordinal)
-    result.push(snapshot)
-  }
-  return result
+/** A Provider action reached an element path without the target the Runtime should have resolved. */
+function requireTarget(target: BrowserProviderTarget | undefined): BrowserProviderTarget {
+  if (target === undefined) throw new BrowserProviderTargetStaleError('the action lost its element reference')
+  return target
 }
 
 function isPlaywrightTarget(value: unknown): value is PlaywrightTarget {
@@ -1176,9 +1271,15 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error
 }
 
-/** Register the Playwright provider with `ctx.browserRuntime`. */
+/**
+ * Register the Playwright provider with `ctx.browserRuntime` and report the
+ * launch facts an operator needs before the first tool call.
+ */
 export function apply(ctx: Context, config: Config = {}): void {
-  ctx.browserRuntime.registerProvider(new PlaywrightBrowserProvider(config))
+  const provider = new PlaywrightBrowserProvider(config)
+  ctx.browserRuntime.registerProvider(provider)
+  const logger = ctx.logger('browser-runtime')
+  const installation = readChromiumInstallation()
+  for (const line of provider.startupReport(installation)) logger.info(line)
+  if (!installation.installed) logger.warn(chromiumMissingMessage(installation))
 }
-
-export default apply

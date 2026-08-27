@@ -5,9 +5,36 @@ import { isIP } from 'node:net'
 import ipaddr from 'ipaddr.js'
 import { BrowserProviderPolicyError } from '../runtime/error.ts'
 
+/**
+ * How much of the address space an environment may reach.
+ *
+ * `strict` admits only globally routable unicast destinations. `allowlist`
+ * keeps that default and adds named hosts and CIDRs, while retaining the policy
+ * proxy, DNS pinning, and the Chromium egress restrictions. `unrestricted`
+ * removes the proxy and those restrictions entirely and is the only mode where
+ * an environment can open an unproxied connection.
+ */
+export type NetworkPolicyMode = 'strict' | 'allowlist' | 'unrestricted'
+
 /** Network policy configuration. */
 export interface NetworkPolicyConfig {
-  readonly allowPrivateNetwork: boolean
+  readonly mode: NetworkPolicyMode
+  /**
+   * Hostnames admitted even when they resolve outside public unicast. An entry
+   * matches exactly; a leading dot matches any subdomain of that suffix.
+   */
+  readonly allowHosts?: readonly string[]
+  /** CIDRs admitted even when they fall outside public unicast. */
+  readonly allowCidrs?: readonly string[]
+  /** CIDRs rejected in every mode, ahead of any allowance. */
+  readonly denyCidrs?: readonly string[]
+}
+
+type ParsedCidr = [ipaddr.IPv4 | ipaddr.IPv6, number]
+
+/** Whether an environment routes through the policy proxy in this mode. */
+export function usesPolicyProxy(mode: NetworkPolicyMode): boolean {
+  return mode !== 'unrestricted'
 }
 
 /** Parsed destination with DNS results validated by the network policy. */
@@ -34,7 +61,20 @@ const WEBSOCKET_PROTOCOLS = new Set(['ws:', 'wss:'])
 
 /** Validate HTTP(S) and WebSocket destinations and reject local/private address ranges by default. */
 export class NetworkPolicy {
-  constructor(private readonly config: NetworkPolicyConfig) {}
+  private readonly allowHosts: readonly string[]
+  private readonly allowCidrs: readonly ParsedCidr[]
+  private readonly denyCidrs: readonly ParsedCidr[]
+
+  constructor(private readonly config: NetworkPolicyConfig) {
+    this.allowHosts = (config.allowHosts ?? []).map(host => host.trim().toLowerCase()).filter(host => host !== '')
+    this.allowCidrs = parseCidrs(config.allowCidrs ?? [], 'allowCidrs')
+    this.denyCidrs = parseCidrs(config.denyCidrs ?? [], 'denyCidrs')
+  }
+
+  /** The configured mode, used by the Provider to decide on proxy and launch controls. */
+  get mode(): NetworkPolicyMode {
+    return this.config.mode
+  }
 
   /**
    * Validate one navigation or request URL, including every resolved address.
@@ -88,20 +128,44 @@ export class NetworkPolicy {
       throw new BrowserProviderPolicyError('browser blocked a URL containing embedded credentials')
     }
     const hostname = stripIpv6Brackets(url.hostname).toLowerCase()
-    if (!this.config.allowPrivateNetwork
+    const hostAllowed = this.allowsHost(hostname)
+    if (this.config.mode === 'strict'
       && (hostname === 'localhost' || hostname.endsWith('.localhost'))) {
       throw new BrowserProviderPolicyError(`browser blocked local hostname: ${hostname}`)
+    }
+    if (this.config.mode === 'allowlist' && !hostAllowed
+      && (hostname === 'localhost' || hostname.endsWith('.localhost'))) {
+      throw new BrowserProviderPolicyError(
+        `browser blocked local hostname: ${hostname}; add it to network.allowHosts to permit it`,
+      )
     }
     const addresses = [...new Set(isIP(hostname) === 0
       ? await resolveAddresses(hostname)
       : [hostname])]
-    if (!this.config.allowPrivateNetwork) {
+    for (const address of addresses) {
+      // A denied range wins in every mode, including an explicitly allowed host.
+      if (matchesAny(address, this.denyCidrs)) {
+        throw new BrowserProviderPolicyError(`browser blocked denied address ${address} for ${hostname}`)
+      }
+    }
+    if (this.config.mode !== 'unrestricted') {
       for (const address of addresses) {
-        if (isPublicAddress(address)) continue
-        throw new BrowserProviderPolicyError(`browser blocked non-public address ${address} for ${hostname}`)
+        if (isPublicAddress(address) || hostAllowed || matchesAny(address, this.allowCidrs)) continue
+        throw new BrowserProviderPolicyError(
+          this.config.mode === 'allowlist'
+            ? `browser blocked non-public address ${address} for ${hostname};`
+              + ' add the host to network.allowHosts or the range to network.allowCidrs'
+            : `browser blocked non-public address ${address} for ${hostname}`,
+        )
       }
     }
     return { url, hostname, addresses }
+  }
+
+  private allowsHost(hostname: string): boolean {
+    return this.allowHosts.some(entry => (
+      entry.startsWith('.') ? hostname === entry.slice(1) || hostname.endsWith(entry) : hostname === entry
+    ))
   }
 }
 
@@ -148,6 +212,36 @@ export async function routeWebSocketWithNetworkPolicy(
     return
   }
   socket.connect()
+}
+
+function parseCidrs(values: readonly string[], field: string): ParsedCidr[] {
+  return values.map((value) => {
+    try {
+      return ipaddr.parseCIDR(value.trim())
+    } catch (error: unknown) {
+      throw new Error(`browser-playwright: network.${field} entry is not a CIDR: ${value}`, { cause: error })
+    }
+  })
+}
+
+function matchesAny(address: string, cidrs: readonly ParsedCidr[]): boolean {
+  if (cidrs.length === 0) return false
+  let parsed: ipaddr.IPv4 | ipaddr.IPv6
+  try {
+    parsed = ipaddr.parse(address)
+  } catch {
+    return false
+  }
+  if (parsed instanceof ipaddr.IPv6 && parsed.isIPv4MappedAddress()) parsed = parsed.toIPv4Address()
+  return cidrs.some((cidr) => {
+    const [network] = cidr
+    if (network.kind() !== parsed.kind()) return false
+    try {
+      return parsed.match(cidr as never)
+    } catch {
+      return false
+    }
+  })
 }
 
 async function resolveAddresses(hostname: string): Promise<string[]> {

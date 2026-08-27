@@ -27,6 +27,7 @@ describe('BrowserRuntime provider selection and ownership', () => {
       capabilities: {
         checkpoint: true,
         screenshot: false,
+        extraction: false,
         multiplePages: false,
         attachExisting: false,
         persistentProfile: false,
@@ -57,6 +58,7 @@ describe('BrowserRuntime provider selection and ownership', () => {
       capabilities: {
         checkpoint: true,
         screenshot: false,
+        extraction: false,
         multiplePages: false,
         attachExisting: false,
         persistentProfile: false,

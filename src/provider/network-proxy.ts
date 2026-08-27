@@ -9,7 +9,7 @@ import type { AddressInfo, LookupFunction, Socket } from 'node:net'
 import type { Duplex } from 'node:stream'
 import { BrowserProviderPolicyError } from '../runtime/error.ts'
 import { NetworkPolicy } from './network-policy.ts'
-import type { ResolvedNetworkTarget } from './network-policy.ts'
+import type { NetworkPolicyMode, ResolvedNetworkTarget } from './network-policy.ts'
 
 /** Browser launch proxy settings with per-environment credentials. */
 export interface NetworkProxySettings {
@@ -27,12 +27,12 @@ const STRICT_NETWORK_ARGS = [
 ] as const
 
 /**
- * Return fixed Chromium egress controls for the configured private-network policy.
+ * Return fixed Chromium egress controls for the configured egress mode.
  * @param allowPrivateNetwork - explicit opt-in to direct private UDP and QUIC.
  * @returns launch arguments owned by the policy proxy design.
  */
-export function chromiumNetworkArgs(allowPrivateNetwork: boolean): readonly string[] {
-  return allowPrivateNetwork ? [] : STRICT_NETWORK_ARGS
+export function chromiumNetworkArgs(mode: NetworkPolicyMode): readonly string[] {
+  return mode === 'unrestricted' ? [] : STRICT_NETWORK_ARGS
 }
 
 /** One owner-only HTTP proxy for browser HTTP, HTTPS, WebSocket, and proxied WebRTC traffic. */
